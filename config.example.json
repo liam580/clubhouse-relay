@@ -1,0 +1,33 @@
+{
+  "bay": {
+    "number": 1,
+    "optixResourceId": "609902"
+  },
+  "relay": {
+    "listenHost": "0.0.0.0",
+    "listenPort": 921
+  },
+  "gspro": {
+    "host": "127.0.0.1",
+    "port": 922
+  },
+  "supabase": {
+    "url": "",
+    "serviceKey": "",
+    "shotsTable": "shots"
+  },
+  "optix": {
+    "graphqlUrl": "https://api.optixapp.com/graphql",
+    "orgToken": "",
+    "pollIntervalMs": 30000,
+    "fetchTimeoutMs": 5000
+  },
+  "session": {
+    "inactivityTimeoutMs": 600000,
+    "backfillWindowMs": 60000
+  },
+  "logging": {
+    "level": "info",
+    "file": "./data/relay.log"
+  }
+}

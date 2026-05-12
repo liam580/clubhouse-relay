@@ -1,0 +1,21 @@
+{
+  "name": "clubhouse-relay",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Clubhouse GS Pro shot data relay — Milestone 1",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "smoke": "node test/smoke.js",
+    "pm2:start": "pm2 start ecosystem.config.js",
+    "pm2:stop": "pm2 stop clubhouse-relay",
+    "pm2:restart": "pm2 restart clubhouse-relay",
+    "pm2:logs": "pm2 logs clubhouse-relay"
+  },
+  "dependencies": {
+    "pino": "^9.5.0"
+  }
+}
