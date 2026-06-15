@@ -6,7 +6,13 @@
 // VIEW captures the swing). Triggering on the earlier files would race the
 // writer and produce torn reads.
 //
-// Persistent last-seen <n> ensures restarts don't re-ingest stale dirs.
+// Startup behavior:
+//   - First run (no last-shot.json yet): initialize the cursor to the highest
+//     existing <n> in ShotData; do NOT backfill VIEW's lifetime history. The
+//     relay only attributes shots from the moment it's installed forward.
+//   - Restart (last-shot.json exists): explicitly process any dirs whose <n>
+//     is strictly greater than the cursor — closes gaps from relay downtime.
+//   - Then chokidar watches with ignoreInitial: true so only new shots fire.
 
 const fs = require('fs');
 const path = require('path');
@@ -14,6 +20,20 @@ const chokidar = require('chokidar');
 const { readShotDir } = require('./view-parser');
 
 const TRIGGER_FILE = 'ProShotInfo.json';
+
+// Numeric subdirs of `root`. Filters out non-numeric / leading-zero names.
+function listShotDirs(root) {
+  if (!fs.existsSync(root)) return [];
+  try {
+    return fs.readdirSync(root, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => ({ name: e.name, n: parseInt(e.name, 10) }))
+      .filter(({ name, n }) => Number.isInteger(n) && n > 0 && String(n) === name)
+      .map(({ n }) => n);
+  } catch {
+    return [];
+  }
+}
 
 function createFileWatcher({ config, logger, lastShot, onShot }) {
   const watchRoot = config.watch.shotDataDir;
@@ -93,14 +113,51 @@ function createFileWatcher({ config, logger, lastShot, onShot }) {
       catch (err) { logger.error({ err: err.message, watchRoot }, 'failed to create watch dir'); }
     }
 
+    const lastSeenAtStart = lastShot.read();
+    const isFreshInstall = !fs.existsSync(lastShot.filePath);
+    const shotDirs = listShotDirs(watchRoot);
+    const existingMaxN = shotDirs.length ? Math.max(...shotDirs) : 0;
+
     logger.info(
-      { watchRoot, lastSeen: lastShot.read(), stabilityMs },
+      { watchRoot, lastSeen: lastSeenAtStart, existingMaxN, freshInstall: isFreshInstall, stabilityMs },
       'starting VIEW file watcher'
     );
+
+    if (isFreshInstall && existingMaxN > 0) {
+      // VIEW had lifetime history before the relay was installed. Treat anything
+      // already on disk as pre-existing and don't backfill it — only attribute
+      // shots from this point forward.
+      logger.info(
+        { existingMaxN, historicalDirs: shotDirs.length },
+        'first run — initializing last-shot cursor to current max, skipping historical backfill'
+      );
+      lastShot.write(existingMaxN);
+    } else if (existingMaxN > lastSeenAtStart) {
+      // Warm start with downtime gap: process the missed shots in numeric order.
+      const missed = shotDirs.filter((n) => n > lastSeenAtStart).sort((a, b) => a - b);
+      logger.info(
+        {
+          lastSeen: lastSeenAtStart,
+          count: missed.length,
+          range: missed.length ? [missed[0], missed[missed.length - 1]] : null
+        },
+        'catching up shots written during downtime'
+      );
+      for (const n of missed) {
+        processFile(path.join(watchRoot, String(n), TRIGGER_FILE));
+      }
+    }
 
     // chokidar v4 removed glob support, so we watch the root and let the
     // basename check in processFile() do the filtering. ShotData/<n>/<file>
     // is depth 2 from the root.
+    //
+    // ignoreInitial stays FALSE: with `true`, chokidar (v4 + native macOS fs
+    // watch) doesn't reliably emit add events for files written immediately
+    // after `ready`. With `false`, chokidar's startup scan re-emits adds for
+    // every existing file — processFile() filters them out via the lastShot
+    // cursor (already advanced above) and the processedInRun set. Trade-off:
+    // a brief CPU blip on startup for guaranteed new-file delivery.
     watcher = chokidar.watch(watchRoot, {
       ignoreInitial: false,
       awaitWriteFinish: {

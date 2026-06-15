@@ -297,6 +297,92 @@ async function chokidarLiveScenario() {
   console.log(`  ✓ chokidar delivered shot in ${Date.now() - start}ms`);
 }
 
+async function coldStartSkipsHistoryScenario() {
+  console.log('\n— scenario: cold start skips VIEW lifetime history —');
+  const watchRoot = makeTempDir();
+  const dataDir = makeTempDir();
+
+  // Pre-populate the watch dir with VIEW's historical shots (mimicking what
+  // the Bay 2 PC had on first install — n=929..993 with gaps).
+  for (const n of [929, 950, 980, 993]) {
+    writeShot(watchRoot, n, SHOTINFO_A, PROINFO_A);
+  }
+
+  const lastShot = createLastShotTracker({ dataDir, logger: silentLogger() });
+  assert.strictEqual(lastShot.read(), 0, 'no last-shot.json yet, read returns 0');
+
+  const captured = [];
+  const watcher = createFileWatcher({
+    config: { watch: { shotDataDir: watchRoot, writeStabilityMs: 50, pollIntervalMs: 20 } },
+    logger: silentLogger(),
+    lastShot,
+    onShot: (s) => captured.push(s)
+  });
+
+  await watcher.start();
+  await sleep(150);     // give chokidar time to settle — none of the historical shots should fire
+
+  assert.strictEqual(captured.length, 0, 'no historical shots backfilled on cold start');
+  assert.strictEqual(lastShot.read(), 993, 'last-shot initialized to max existing n');
+
+  // A fresh shot above 993 should fire normally now.
+  writeShot(watchRoot, 994, SHOTINFO_B, PROINFO_B);
+  const start = Date.now();
+  while (captured.length === 0 && Date.now() - start < 3000) await sleep(50);
+  await watcher.stop();
+
+  assert.strictEqual(captured.length, 1, 'new shot after cold-start IS delivered');
+  assert.strictEqual(captured[0].shotNumber, 994);
+  assert.strictEqual(lastShot.read(), 994);
+
+  console.log('  ✓ 4 historical shots skipped');
+  console.log('  ✓ last-shot initialized to 993 (current max)');
+  console.log('  ✓ subsequent new shot fired normally');
+}
+
+async function warmStartCatchesUpScenario() {
+  console.log('\n— scenario: warm start catches up shots written during downtime —');
+  const watchRoot = makeTempDir();
+  const dataDir = makeTempDir();
+
+  // Pre-existing last-shot cursor at 100.
+  fs.writeFileSync(
+    path.join(dataDir, 'last-shot.json'),
+    JSON.stringify({ n: 100, updated_at: new Date().toISOString() })
+  );
+
+  // Shots that landed during downtime: some above the cursor (catch up), some below (skip).
+  writeShot(watchRoot, 95,  SHOTINFO_A, PROINFO_A);
+  writeShot(watchRoot, 102, SHOTINFO_A, PROINFO_A);
+  writeShot(watchRoot, 104, SHOTINFO_B, PROINFO_B);
+
+  const lastShot = createLastShotTracker({ dataDir, logger: silentLogger() });
+  assert.strictEqual(lastShot.read(), 100);
+
+  const captured = [];
+  const watcher = createFileWatcher({
+    config: { watch: { shotDataDir: watchRoot, writeStabilityMs: 50, pollIntervalMs: 20 } },
+    logger: silentLogger(),
+    lastShot,
+    onShot: (s) => captured.push(s)
+  });
+
+  await watcher.start();
+  await sleep(100);
+  await watcher.stop();
+
+  assert.strictEqual(captured.length, 2, 'two missed shots caught up');
+  assert.deepStrictEqual(
+    captured.map((s) => s.shotNumber).sort((a, b) => a - b),
+    [102, 104]
+  );
+  assert.strictEqual(lastShot.read(), 104);
+
+  console.log('  ✓ above-cursor shots caught up in numeric order');
+  console.log('  ✓ below-cursor shot skipped');
+  console.log('  ✓ last-shot advanced to highest caught-up n');
+}
+
 function ballisticScenario() {
   console.log('\n— scenario: ballistic carry computation produces plausible values —');
 
@@ -763,6 +849,8 @@ async function shotTaggingScenario() {
     await referenceShotFilteredScenario();
     await restartResumeScenario();
     await chokidarLiveScenario();
+    await coldStartSkipsHistoryScenario();
+    await warmStartCatchesUpScenario();
     ballisticScenario();
 
     // M2 — Supabase + JSONL with VIEW-shaped rows
