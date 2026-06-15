@@ -852,21 +852,65 @@ async function backfillScenario() {
   console.log('  ✓ recent shot tagged, old shot left alone');
 }
 
-async function inactivityScenario() {
-  console.log('\n— scenario: inactivity timeout closes session as safety net —');
+async function inactivityWithActiveBookingScenario() {
+  console.log('\n— scenario: inactivity timeout with booking STILL active — session stays open —');
+  // Regression test for the "10-min coffee break splits one booking into two
+  // sessions rows" bug. Inactivity fires, but Optix still has the booking, so
+  // the session must NOT close.
   const ctx = await setupM3();
   ctx.config.session.inactivityTimeoutMs = 200;
   await ctx.sessionManager.stop();
   ctx.sessionManager = createSessionManager({
     config: ctx.config, logger: ctx.logger, optixClient: ctx.optixClient, supabase: ctx.supabase,
   });
-  ctx.optixState.currentByResource['609902'] = makeBooking({ booking_id: 'bk-i' });
+  ctx.optixState.currentByResource['609902'] = makeBooking({ booking_id: 'bk-still-active' });
+  await ctx.sessionManager._runPollOnce();
+  const tagBefore = ctx.sessionManager.getCurrentTag();
+  assert.ok(tagBefore, 'session opened');
+
+  // Booking stays active through the idle window.
+  await sleep(350);
+
+  const tagAfter = ctx.sessionManager.getCurrentTag();
+  assert.ok(tagAfter, 'session stays open while Optix still has the booking');
+  assert.strictEqual(tagAfter.session_id, tagBefore.session_id, 'same session_id — no new row created');
+
+  // Only one sessions row should ever have been POSTed.
+  const sessionPosts = ctx.supa.requests.filter(
+    (r) => r.method === 'POST' && r.url.startsWith('/rest/v1/sessions')
+  );
+  assert.strictEqual(sessionPosts.length, 1, 'no duplicate session row from inactivity-triggered re-poll');
+
+  await teardownM3(ctx);
+  console.log('  ✓ inactivity fired, re-polled Optix, booking still active → no close, no duplicate row');
+}
+
+async function inactivityWithEndedBookingScenario() {
+  console.log('\n— scenario: inactivity timeout with booking ENDED — session closes —');
+  // Safety net still works when Optix legitimately reports the booking is gone.
+  const ctx = await setupM3();
+  ctx.config.session.inactivityTimeoutMs = 200;
+  await ctx.sessionManager.stop();
+  ctx.sessionManager = createSessionManager({
+    config: ctx.config, logger: ctx.logger, optixClient: ctx.optixClient, supabase: ctx.supabase,
+  });
+  ctx.optixState.currentByResource['609902'] = makeBooking({ booking_id: 'bk-ending' });
   await ctx.sessionManager._runPollOnce();
   assert.ok(ctx.sessionManager.getCurrentTag());
+
+  // Booking ends before the inactivity fires.
+  ctx.optixState.currentByResource['609902'] = null;
+
   await sleep(350);
-  assert.strictEqual(ctx.sessionManager.getCurrentTag(), null);
+
+  assert.strictEqual(
+    ctx.sessionManager.getCurrentTag(),
+    null,
+    'session closes when inactivity-triggered poll reports booking gone'
+  );
+
   await teardownM3(ctx);
-  console.log('  ✓ session closed by safety net');
+  console.log('  ✓ booking ended + inactivity → session closed (safety net intact)');
 }
 
 async function optixErrorScenario() {
@@ -968,7 +1012,8 @@ async function shotTaggingScenario() {
     await sessionStableAcrossPollsScenario();
     await sessionClosesScenario();
     await backfillScenario();
-    await inactivityScenario();
+    await inactivityWithActiveBookingScenario();
+    await inactivityWithEndedBookingScenario();
     await optixErrorScenario();
     await restartResumeOptixScenario();
     await shotTaggingScenario();

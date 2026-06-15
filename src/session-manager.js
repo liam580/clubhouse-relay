@@ -52,13 +52,24 @@ function createSessionManager({ config, logger, optixClient, supabase }) {
   function armInactivityTimer() {
     if (inactivityTimer) clearTimeout(inactivityTimer);
     inactivityTimer = setTimeout(() => {
+      if (state !== STATE.SESSION_OPEN) return;
       logger.warn(
         { bay: bayNumber, sessionId: currentSession?.id, threshold: inactivityMs },
-        'inactivity timeout — closing session as safety net'
+        'inactivity timeout fired — re-polling Optix to decide whether to close'
       );
-      closeSession('inactivity_timeout').catch((err) =>
-        logger.error({ err: err.message }, 'inactivity close failed')
-      );
+      // Don't close directly. Trigger an Optix poll: if the booking is still
+      // active, the session stays open and we rearm; if the booking actually
+      // ended, the poll's close path handles it. This stops 10-min coffee
+      // breaks within an active booking from splitting one bay rental into
+      // multiple `sessions` rows (which used to happen because the inactivity
+      // close + next poll's open created a fresh session row each time).
+      _runPollOnce()
+        .catch((err) => logger.error({ err: err.message }, 'inactivity-triggered poll failed'))
+        .finally(() => {
+          // If the session is still open after the poll, rearm so the NEXT
+          // 10-min idle stretch within the same booking re-checks Optix.
+          if (state === STATE.SESSION_OPEN) armInactivityTimer();
+        });
     }, inactivityMs);
   }
 
