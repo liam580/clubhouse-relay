@@ -28,6 +28,16 @@ function num(str) {
   return Number.isFinite(n) ? n : null;
 }
 
+// VIEW writes ball + club velocities in m/s regardless of the user's "mph
+// vs km/h" preference in HKCU. The downstream schema, ballistic model, and
+// app UI all use mph, so we convert at the parser boundary and surface mph
+// to everything else. Sanity check: a 7-iron ball speed of 50.4 m/s is
+// 112.7 mph, which matches what GS Pro / VIEW displays on screen.
+const MPH_PER_MS = 2.23694;
+function msToMph(ms) {
+  return ms == null ? null : ms * MPH_PER_MS;
+}
+
 function readJson(filePath) {
   const content = fs.readFileSync(filePath, 'utf8');
   return JSON.parse(content);
@@ -62,16 +72,16 @@ function readShotDir({ dir, shotNumber }) {
     ok: true,
     value: {
       shotNumber,
-      // Ball kinematics
-      ballSpeed: num(data.ballspeed),
-      vla:       num(data.incline),    // vertical launch angle (deg)
-      hla:       num(data.azimuth),    // horizontal launch angle (deg)
-      backspin:  num(data.backspin),   // rpm
-      sidespin:  num(data.sidespin),   // rpm
-      totalSpin: num(data.spinmag2d),  // rpm
-      spinAxis:  num(data.spinaxis2d), // deg
+      // Ball kinematics — velocities converted m/s → mph at the boundary.
+      ballSpeed: msToMph(num(data.ballspeed)),   // mph (converted from m/s)
+      vla:       num(data.incline),              // vertical launch angle (deg)
+      hla:       num(data.azimuth),              // horizontal launch angle (deg)
+      backspin:  num(data.backspin),             // rpm
+      sidespin:  num(data.sidespin),             // rpm
+      totalSpin: num(data.spinmag2d),            // rpm
+      spinAxis:  num(data.spinaxis2d),           // deg
       // Club kinematics
-      clubSpeed:      num(data.clubspeed),
+      clubSpeed:      msToMph(num(data.clubspeed)), // mph (converted from m/s)
       clubPath:       num(data.clubpath),
       faceAngle:      num(data.clubfaceangle),
       attackAngle:    num(data.clubattackangle),

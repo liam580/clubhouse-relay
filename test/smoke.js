@@ -18,7 +18,10 @@ const { createSessionManager } = require('../src/session-manager');
 
 // ─── VIEW shot fixtures ─────────────────────────────────────────────────
 // SHOT A is verbatim from the Bay 2 PC capture (ShotData/993). Padded
-// numeric strings exactly as VIEW writes them.
+// numeric strings exactly as VIEW writes them. Velocity fields (ballspeed,
+// clubspeed) are in m/s — the parser converts to mph at the boundary, so
+// expected ballSpeed in mph is 45.08 * 2.23694 ≈ 100.82.
+const MPH_PER_MS = 2.23694;
 
 const SHOTINFO_A = {
   DATA: {
@@ -46,16 +49,18 @@ const SHOTINFO_A = {
 };
 const PROINFO_A = { Name: "ClubHouse", Association: "--", Slope: "", Club: 24, ClubName: "IRON7", Star: false, Hand: 0 };
 
+// SHOT B — synthetic driver swing. Realistic m/s values: 73.76 m/s ball
+// ≈ 165 mph (tour driver), 51.41 m/s club ≈ 115 mph (tour driver head speed).
 const SHOTINFO_B = {
   DATA: {
-    "ballspeed":             "  152.3400",
+    "ballspeed":             "   73.7600",
     "incline":               "   13.5200",
     "azimuth":               "    1.1100",
     "backspin":              " 2650.0000",
     "sidespin":              " -200.0000",
     "spinmag2d":             " 2657.5300",
     "spinaxis2d":            "   -4.3200",
-    "clubspeed":             "  108.7700",
+    "clubspeed":             "   51.4100",
     "Assurance_clubspeed":   "92",
     "clubpath":              "    0.5500",
     "Assurance_clubpath":    "88",
@@ -139,9 +144,13 @@ async function singleShotScenario() {
   assert.strictEqual(captured.length, 1);
   const shot = captured[0];
   assert.strictEqual(shot.shotNumber, 1);
-  assert.ok(Math.abs(shot.ballSpeed - 45.08) < 0.001, 'ballspeed parsed from padded string');
-  assert.ok(Math.abs(shot.vla - 19.7957) < 0.001, 'incline → vla');
-  assert.ok(Math.abs(shot.hla - 0.306) < 0.001, 'azimuth → hla');
+  // VIEW writes velocities in m/s; parser converts to mph. 45.08 m/s → 100.82 mph.
+  assert.ok(Math.abs(shot.ballSpeed - 45.08 * MPH_PER_MS) < 0.01,
+    `ballSpeed should be 45.08 m/s converted to mph, got ${shot.ballSpeed}`);
+  assert.ok(Math.abs(shot.clubSpeed - 35.1305 * MPH_PER_MS) < 0.01,
+    `clubSpeed should be 35.13 m/s converted to mph, got ${shot.clubSpeed}`);
+  assert.ok(Math.abs(shot.vla - 19.7957) < 0.001, 'incline → vla (deg, no conversion)');
+  assert.ok(Math.abs(shot.hla - 0.306) < 0.001, 'azimuth → hla (deg, no conversion)');
   assert.strictEqual(shot.clubName, 'IRON7');
   assert.strictEqual(shot.clubId, 24);
   assert.strictEqual(shot.playerName, 'ClubHouse');
@@ -149,6 +158,8 @@ async function singleShotScenario() {
   assert.strictEqual(lastShot.read(), 1);
 
   console.log('  ✓ padded-string numerics float-cast');
+  console.log(`  ✓ ballSpeed converted m/s → mph (${shot.ballSpeed.toFixed(2)} mph)`);
+  console.log(`  ✓ clubSpeed converted m/s → mph (${shot.clubSpeed.toFixed(2)} mph)`);
   console.log('  ✓ ClubName + Club + player Name carried');
   console.log('  ✓ assurance per-measurement values float-cast');
   console.log('  ✓ last-shot.json advanced');
@@ -394,10 +405,11 @@ function ballisticScenario() {
   const fullIron = computeCarryYards({ ballSpeedMph: 120, vlaDeg: 18, backspinRpm: 7000 });
   assert.ok(fullIron > 120 && fullIron < 220, `full iron carry ${fullIron?.toFixed(1)} should be 120–220 yd`);
 
-  // The actual sample shot from the bay: 45 mph ball + 8340 rpm = chunky half-swing.
-  // Real-world carry here is genuinely short. Just confirm we produce a finite number.
-  const softIron = computeCarryYards({ ballSpeedMph: 45.08, vlaDeg: 19.7957, backspinRpm: 8337.92 });
-  assert.ok(softIron != null && softIron > 0 && softIron < 100, `soft iron carry ${softIron?.toFixed(1)} should be a positive, sub-100 yd value`);
+  // The actual bay sample shot, in corrected units: 45.08 m/s = 100.82 mph (full 7-iron),
+  // 19.8° launch, ~8340 rpm. Real-world reference: Liam reported 155 yd carry on the
+  // simulator for a similar swing — model should land in that ballpark.
+  const bayShot = computeCarryYards({ ballSpeedMph: 45.08 * MPH_PER_MS, vlaDeg: 19.7957, backspinRpm: 8337.92 });
+  assert.ok(bayShot > 80 && bayShot < 200, `bay 7-iron carry ${bayShot?.toFixed(1)} should be 80–200 yd`);
 
   // Bad inputs → null, not NaN
   assert.strictEqual(computeCarryYards({ ballSpeedMph: NaN, vlaDeg: 10, backspinRpm: 2000 }), null);
@@ -405,7 +417,7 @@ function ballisticScenario() {
 
   console.log(`  ✓ driver model: ${driver.toFixed(1)} yd`);
   console.log(`  ✓ full 7-iron model: ${fullIron.toFixed(1)} yd`);
-  console.log(`  ✓ soft iron (bay sample): ${softIron.toFixed(1)} yd`);
+  console.log(`  ✓ bay sample 7-iron (100.82 mph): ${bayShot.toFixed(1)} yd`);
   console.log('  ✓ NaN / negative launch return null');
 }
 
@@ -616,7 +628,9 @@ async function supabasePostScenario() {
   assert.strictEqual(body.session_id, null);
   assert.strictEqual(body.player_id, null);
   assert.strictEqual(body.shot_number, 1);
-  assert.ok(Math.abs(body.ball_speed - 45.08) < 0.001);
+  // ball_speed in DB is mph after the m/s → mph conversion in the parser.
+  assert.ok(Math.abs(body.ball_speed - 45.08 * MPH_PER_MS) < 0.01,
+    `ball_speed should be in mph, got ${body.ball_speed}`);
   assert.ok(Math.abs(body.vla - 19.7957) < 0.001, 'incline → vla');
   assert.ok(Math.abs(body.hla - 0.306) < 0.001, 'azimuth → hla');
   assert.strictEqual(body.club, 'IRON7', 'ClubName → club column');
