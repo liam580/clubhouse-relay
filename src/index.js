@@ -7,8 +7,10 @@ const { createSupabaseClient } = require('./supabase');
 const { createOptixClient } = require('./optix-client');
 const { createSessionManager } = require('./session-manager');
 const { createPersistence } = require('./persistence');
-const { createFileWatcher } = require('./file-watcher');
-const { createLastShotTracker } = require('./last-shot');
+const { createConnectLogTail } = require('./connect-log-tail');
+const { createReassembler } = require('./reassembler');
+const { createProShotInfoSideWatcher } = require('./proshotinfo-side-watcher');
+const { envelopeToShot } = require('./gspro-parser');
 
 async function main() {
   const configPath = process.env.RELAY_CONFIG || path.resolve(__dirname, '..', 'config.json');
@@ -17,17 +19,15 @@ async function main() {
 
   logger.info(
     {
-      bay: config.bay.number,
-      watchRoot: config.watch.shotDataDir,
-      supabase: config.supabase.serviceKey ? 'enabled' : 'disabled',
-      optix: config.optix?.orgToken ? 'enabled' : 'disabled',
-      configPath
+      bay:        config.bay.number,
+      connectLog: config.connect.logPath,
+      watchRoot:  config.watch.shotDataDir,
+      supabase:   config.supabase.serviceKey ? 'enabled' : 'disabled',
+      optix:      config.optix?.orgToken ? 'enabled' : 'disabled',
+      configPath,
     },
     'starting clubhouse-relay'
   );
-
-  const dataDir = path.resolve(__dirname, '..', 'data');
-  const lastShot = createLastShotTracker({ dataDir, logger });
 
   const supabase = createSupabaseClient({ config, logger });
   const optixClient = createOptixClient({ config, logger });
@@ -37,28 +37,47 @@ async function main() {
     config,
     logger,
     supabase,
-    getTag: () => sessionManager.getCurrentTag()
+    getTag: () => sessionManager.getCurrentTag(),
   });
 
-  const watcher = createFileWatcher({
-    config,
+  // Side-watcher: maintains an in-memory cache of the most recent
+  // ProShotInfo.json so each Connect-sourced shot can be attributed to a
+  // player/club. The Connect envelope has no player identity.
+  const sideWatcher = createProShotInfoSideWatcher({ config, logger });
+
+  // Reassembler: merges the 4 log lines per shot (ball+club halves, each
+  // emitted at DEBUG+INFO) into a single envelope, then hands off.
+  const reassembler = createReassembler({
+    timeoutMs: 3000,
+    sweepIntervalMs: 1000,
     logger,
-    lastShot,
-    onShot: (shot) => {
+    onShot: (mergedEnv) => {
+      const shot = envelopeToShot(mergedEnv, sideWatcher.get());
       try {
         persistence.saveShot(shot);
       } catch (err) {
-        logger.error({ err: err.message }, 'persistence.saveShot threw');
+        logger.error({ err: err.message, ShotNumber: shot.shotNumber }, 'persistence.saveShot threw');
       }
       try {
         sessionManager.noteShot();
       } catch (err) {
         logger.error({ err: err.message }, 'sessionManager.noteShot threw');
       }
-    }
+    },
   });
 
-  await watcher.start();
+  // Connect log tail: reads ConnectDebug.txt, extracts envelopes, feeds the
+  // reassembler. This is the canonical ingress — every shot GSPconnect sends
+  // to GS Pro is mirrored here in mph/yards with carry pre-computed.
+  const logTail = createConnectLogTail({
+    config,
+    logger,
+    onEnvelope: (env) => reassembler.feed(env),
+  });
+
+  await sideWatcher.start();
+  reassembler.start();
+  await logTail.start();
 
   // Non-blocking Supabase reachability check.
   supabase.healthCheck().then((result) => {
@@ -69,9 +88,7 @@ async function main() {
     logger.error({ err: err.message }, 'supabase health check threw');
   });
 
-  // Start the Optix poll loop. start() runs an immediate poll and schedules
-  // the recurring loop. We don't await it — a slow first poll must not delay
-  // the watcher.
+  // Start the Optix poll loop.
   sessionManager.start().catch((err) => {
     logger.error({ err: err.message }, 'session manager start failed');
   });
@@ -83,7 +100,9 @@ async function main() {
     logger.info({ signal }, 'shutting down');
     try {
       await sessionManager.stop();
-      await watcher.stop();
+      logTail.stop();
+      reassembler.stop();
+      await sideWatcher.stop();
       await persistence.close();
     } catch (err) {
       logger.error({ err: err.message }, 'error during shutdown');

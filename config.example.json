@@ -3,10 +3,13 @@
     "number": 2,
     "optixResourceId": "619992"
   },
+  "connect": {
+    "logPath": "C:\\GSProV1\\Core\\GSPC\\ConnectDebug.txt",
+    "fromBeginning": false
+  },
   "watch": {
     "shotDataDir": "C:\\Users\\suppo\\AppData\\LocalLow\\Uneekor\\VIEW\\ShotData",
-    "writeStabilityMs": 500,
-    "pollIntervalMs": 100
+    "proShotInfoStaleMs": 30000
   },
   "supabase": {
     "url": "",

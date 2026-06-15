@@ -69,11 +69,19 @@ create table if not exists public.shots (
 );
 
 -- VIEW-source columns added by the file-watch pivot. The original schema was
--- written against the GS Pro Connect V1 TCP payload (which Uneekor doesn't
--- actually emit at this install); these capture the extra context VIEW writes.
+-- written against the GS Pro Connect V1 TCP payload; these capture the extra
+-- context VIEW writes via ProShotInfo.json.
 alter table public.shots add column if not exists club_id   integer;
 alter table public.shots add column if not exists hand      smallint;
 alter table public.shots add column if not exists assurance jsonb;
+
+-- Connect-log-tail pivot: the relay now reads the post-translation GS Pro
+-- Open Connect envelope from GSPconnect's ConnectDebug.txt. The envelope
+-- splits TotalSpin into BackSpin + SideSpin and exposes SpeedAtImpact —
+-- promote those to first-class columns.
+alter table public.shots add column if not exists back_spin       double precision;
+alter table public.shots add column if not exists side_spin       double precision;
+alter table public.shots add column if not exists speed_at_impact double precision;
 
 create index if not exists idx_shots_player_id      on public.shots(player_id);
 create index if not exists idx_shots_session_id     on public.shots(session_id);

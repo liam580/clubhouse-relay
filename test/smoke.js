@@ -8,76 +8,83 @@ const net = require('net');
 const assert = require('assert');
 
 const { createPersistence } = require('../src/persistence');
-const { createFileWatcher } = require('../src/file-watcher');
-const { createLastShotTracker } = require('../src/last-shot');
-const { readShotDir } = require('../src/view-parser');
-const { computeCarryYards } = require('../src/ballistic');
+const { createReassembler } = require('../src/reassembler');
+const { extractEnvelope, MARKER } = require('../src/connect-log-tail');
+const { envelopeToShot, deriveSpinAxis, deriveTotalSpin } = require('../src/gspro-parser');
+const { createProShotInfoSideWatcher } = require('../src/proshotinfo-side-watcher');
 const { createSupabaseClient } = require('../src/supabase');
 const { createOptixClient } = require('../src/optix-client');
 const { createSessionManager } = require('../src/session-manager');
 
-// ─── VIEW shot fixtures ─────────────────────────────────────────────────
-// SHOT A is verbatim from the Bay 2 PC capture (ShotData/993). Padded
-// numeric strings exactly as VIEW writes them. Velocity fields (ballspeed,
-// clubspeed) are in m/s — the parser converts to mph at the boundary, so
-// expected ballSpeed in mph is 45.08 * 2.23694 ≈ 100.82.
-const MPH_PER_MS = 2.23694;
+// ─── Connect envelope fixtures ──────────────────────────────────────────
+// Verbatim shape inspired by the Bay 2 capture (shot 42508). All units
+// already in mph / yards / deg / rpm — that's the whole point of reading
+// the post-translation log.
 
-const SHOTINFO_A = {
-  DATA: {
-    "ballspeed":             "   45.0800",
-    "incline":               "   19.7957",
-    "azimuth":               "    0.3060",
-    "backspin":              " 8337.9229",
-    "sidespin":              "  199.6212",
-    "spinmag2d":             " 8340.3125",
-    "spinaxis2d":            "    1.3715",
-    "clubspeed":             "   35.1305",
-    "Assurance_clubspeed":   "89",
-    "clubpath":              "   -0.7444",
-    "Assurance_clubpath":    "85",
-    "clubfaceangle":         "    0.4227",
-    "Assurance_clubfaceangle": "75",
-    "clubattackangle":       "   -7.5356",
-    "Assurance_clubattackangle": "1",
-    "clubloftangle":         "    0.0000",
-    "clublieangle":          "    0.0000",
-    "clubfaceimpactLateral": "    0.0000",
-    "clubfaceimpactVertical": "    0.0000"
-  },
-  BALLIMPACT: { valid: "1", name: "ballimpact.jpg", xpos: "128", ypos: "119", radius: "37" }
+const HEARTBEAT_ENV = {
+  DeviceID: "UNEEKOREYEXR",
+  Units: "Yards",
+  ShotNumber: 42507,
+  APIversion: "2",
+  BallData: {},
+  ClubData: {},
+  ShotDataOptions: { IsHeartBeat: true, ContainsBallData: false, ContainsClubData: false },
 };
-const PROINFO_A = { Name: "ClubHouse", Association: "--", Slope: "", Club: 24, ClubName: "IRON7", Star: false, Hand: 0 };
 
-// SHOT B — synthetic driver swing. Realistic m/s values: 73.76 m/s ball
-// ≈ 165 mph (tour driver), 51.41 m/s club ≈ 115 mph (tour driver head speed).
-const SHOTINFO_B = {
-  DATA: {
-    "ballspeed":             "   73.7600",
-    "incline":               "   13.5200",
-    "azimuth":               "    1.1100",
-    "backspin":              " 2650.0000",
-    "sidespin":              " -200.0000",
-    "spinmag2d":             " 2657.5300",
-    "spinaxis2d":            "   -4.3200",
-    "clubspeed":             "   51.4100",
-    "Assurance_clubspeed":   "92",
-    "clubpath":              "    0.5500",
-    "Assurance_clubpath":    "88",
-    "clubfaceangle":         "    0.3300",
-    "Assurance_clubfaceangle": "82",
-    "clubattackangle":       "   -1.2000",
-    "Assurance_clubattackangle": "75",
-    "clubloftangle":         "    0.0000",
-    "clublieangle":          "    0.0000",
-    "clubfaceimpactLateral": "    0.0000",
-    "clubfaceimpactVertical": "    0.0000"
+const SHOT_BALL_ENV = {
+  DeviceID: "UNEEKOR EYEXR",
+  Units: "Yards",
+  ShotNumber: 42508,
+  APIversion: "2",
+  BallData: {
+    Speed: 95.59339655410767,
+    SpinAxis: 0.0,           // EYE XO2 quirk — zero here, derive from back+side
+    TotalSpin: 0.0,
+    BackSpin: 4521.0,
+    SideSpin: -188.0,
+    HLA: -2.31,
+    VLA: 18.93,
+    CarryDistance: 122.32721216509229,
   },
-  BALLIMPACT: { valid: "1", name: "ballimpact.jpg", xpos: "120", ypos: "115", radius: "38" }
+  ClubData: null,
+  ShotDataOptions: { ContainsBallData: true, ContainsClubData: false, IsHeartBeat: false },
 };
-const PROINFO_B = { Name: "Tester", Association: "--", Slope: "", Club: 1, ClubName: "DRIVER", Star: false, Hand: 0 };
 
-const PROINFO_REFERENCE = { Name: "S.Y.Baek", Association: "KPGA", Slope: "", Club: 7, ClubName: "WEDGE", Star: true, Hand: 0 };
+const SHOT_CLUB_ENV = {
+  DeviceID: "UNEEKOR EYEXR",
+  Units: "Yards",
+  ShotNumber: 42508,
+  APIversion: "2",
+  BallData: null,
+  ClubData: {
+    Speed: 69.60,
+    AngleOfAttack: -3.2,
+    FaceToTarget: 2.581,
+    Lie: 0.0,
+    Loft: 0.0,
+    Path: -6.745,
+    SpeedAtImpact: 69.60,
+    VerticalFaceImpact: 0.0,
+    HorizontalFaceImpact: 0.0,
+    ClosureRate: 0.0,
+  },
+  ShotDataOptions: { ContainsBallData: false, ContainsClubData: true, IsHeartBeat: false, IsSpinEstimated: true },
+};
+
+// Second shot used in some scenarios.
+const SHOT2_BALL_ENV = {
+  ...SHOT_BALL_ENV,
+  ShotNumber: 42509,
+  BallData: { ...SHOT_BALL_ENV.BallData, Speed: 112.7, CarryDistance: 155.4, BackSpin: 7000, SideSpin: -1500 },
+};
+const SHOT2_CLUB_ENV = {
+  ...SHOT_CLUB_ENV,
+  ShotNumber: 42509,
+  ClubData: { ...SHOT_CLUB_ENV.ClubData, Speed: 85.4, SpeedAtImpact: 85.4 },
+};
+
+const PROSHOTINFO_A = { Name: "ClubHouse", Association: "--", Slope: "", Club: 24, ClubName: "IRON7", Star: false, Hand: 0 };
+const PROSHOTINFO_REFERENCE = { Name: "S.Y.Baek", Association: "KPGA", Slope: "", Club: 7, ClubName: "WEDGE", Star: true, Hand: 0 };
 
 // ─── helpers ────────────────────────────────────────────────────────────
 
@@ -94,10 +101,9 @@ function silentLogger() {
   return inst;
 }
 
-function writeShot(root, n, shotinfo, proInfo) {
+function writeProShotInfo(root, n, proInfo) {
   const dir = path.join(root, String(n));
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, 'shotinfo.json'), JSON.stringify(shotinfo));
   fs.writeFileSync(path.join(dir, 'ProShotInfo.json'), JSON.stringify(proInfo));
   return dir;
 }
@@ -113,315 +119,346 @@ async function getFreePort() {
   });
 }
 
-function buildSampleShot(shotinfo, proInfo, n = 1) {
-  const tmp = makeTempDir();
-  fs.writeFileSync(path.join(tmp, 'shotinfo.json'), JSON.stringify(shotinfo));
-  fs.writeFileSync(path.join(tmp, 'ProShotInfo.json'), JSON.stringify(proInfo));
-  const r = readShotDir({ dir: tmp, shotNumber: n });
-  assert.ok(r.ok, `buildSampleShot expected ok, got ${JSON.stringify(r)}`);
-  return r.value;
-}
+// ─── M1 scenarios — parser, log extractor, reassembler ──────────────────
 
-// ─── M1 scenarios (parser + file watcher) ───────────────────────────────
+function envelopeToShotScenario() {
+  console.log('\n— scenario: envelopeToShot — direct field copy, no unit conversion —');
 
-async function singleShotScenario() {
-  console.log('\n— scenario: single shot lands and is parsed correctly —');
-  const watchRoot = makeTempDir();
-  const dataDir = makeTempDir();
-  const lastShot = createLastShotTracker({ dataDir, logger: silentLogger() });
-  const captured = [];
+  const merged = { ...SHOT_BALL_ENV, BallData: SHOT_BALL_ENV.BallData, ClubData: SHOT_CLUB_ENV.ClubData };
+  const shot = envelopeToShot(merged, PROSHOTINFO_A);
 
-  const watcher = createFileWatcher({
-    config: { watch: { shotDataDir: watchRoot, writeStabilityMs: 50, pollIntervalMs: 20 } },
-    logger: silentLogger(),
-    lastShot,
-    onShot: (s) => captured.push(s)
-  });
+  // Direct copies, no conversion
+  assert.strictEqual(shot.shotNumber, 42508);
+  assert.ok(Math.abs(shot.ballSpeed - 95.5933) < 0.001, `ballSpeed direct copy, got ${shot.ballSpeed}`);
+  assert.ok(Math.abs(shot.carryDistance - 122.3272) < 0.001, `carryDistance DIRECT from Connect, got ${shot.carryDistance}`);
+  assert.ok(Math.abs(shot.clubSpeed - 69.60) < 0.001, 'clubSpeed direct copy');
+  assert.strictEqual(shot.hla, -2.31);
+  assert.strictEqual(shot.vla, 18.93);
+  assert.strictEqual(shot.backSpin, 4521);
+  assert.strictEqual(shot.sideSpin, -188);
+  assert.strictEqual(shot.attackAngle, -3.2);
+  assert.strictEqual(shot.clubPath, -6.745);
+  assert.strictEqual(shot.faceAngle, 2.581);
+  assert.strictEqual(shot.speedAtImpact, 69.60);
 
-  writeShot(watchRoot, 1, SHOTINFO_A, PROINFO_A);
-  watcher._processFile(path.join(watchRoot, '1', 'ProShotInfo.json'));
+  // Connect emitted SpinAxis: 0 and TotalSpin: 0 — derive from back/side
+  assert.ok(shot.totalSpin > 0, `totalSpin derived from backspin+sidespin, got ${shot.totalSpin}`);
+  assert.ok(Math.abs(shot.totalSpin - Math.hypot(4521, -188)) < 0.01, 'totalSpin = hypot(back, side)');
+  assert.ok(shot.spinAxis < 0, `spinAxis derived (negative because SideSpin negative), got ${shot.spinAxis}`);
 
-  assert.strictEqual(captured.length, 1);
-  const shot = captured[0];
-  assert.strictEqual(shot.shotNumber, 1);
-  // VIEW writes velocities in m/s; parser converts to mph. 45.08 m/s → 100.82 mph.
-  assert.ok(Math.abs(shot.ballSpeed - 45.08 * MPH_PER_MS) < 0.01,
-    `ballSpeed should be 45.08 m/s converted to mph, got ${shot.ballSpeed}`);
-  assert.ok(Math.abs(shot.clubSpeed - 35.1305 * MPH_PER_MS) < 0.01,
-    `clubSpeed should be 35.13 m/s converted to mph, got ${shot.clubSpeed}`);
-  assert.ok(Math.abs(shot.vla - 19.7957) < 0.001, 'incline → vla (deg, no conversion)');
-  assert.ok(Math.abs(shot.hla - 0.306) < 0.001, 'azimuth → hla (deg, no conversion)');
-  assert.strictEqual(shot.clubName, 'IRON7');
-  assert.strictEqual(shot.clubId, 24);
+  // ProShotInfo context attached
   assert.strictEqual(shot.playerName, 'ClubHouse');
-  assert.strictEqual(shot.assurance.clubSpeed, 89);
-  assert.strictEqual(lastShot.read(), 1);
+  assert.strictEqual(shot.clubId, 24);
+  assert.strictEqual(shot.clubName, 'IRON7');
+  assert.strictEqual(shot.hand, 0);
 
-  console.log('  ✓ padded-string numerics float-cast');
-  console.log(`  ✓ ballSpeed converted m/s → mph (${shot.ballSpeed.toFixed(2)} mph)`);
-  console.log(`  ✓ clubSpeed converted m/s → mph (${shot.clubSpeed.toFixed(2)} mph)`);
-  console.log('  ✓ ClubName + Club + player Name carried');
-  console.log('  ✓ assurance per-measurement values float-cast');
-  console.log('  ✓ last-shot.json advanced');
+  // Envelope metadata
+  assert.strictEqual(shot.deviceId, 'UNEEKOR EYEXR');
+  assert.strictEqual(shot.units, 'Yards');
+  assert.strictEqual(shot.apiVersion, '2');
+
+  // Raw preserved
+  assert.ok(shot.raw && shot.raw.ShotNumber === 42508);
+
+  console.log('  ✓ ballSpeed/carryDistance/clubSpeed copied verbatim (no unit conversion)');
+  console.log(`  ✓ totalSpin derived from BackSpin+SideSpin: ${shot.totalSpin.toFixed(1)} rpm`);
+  console.log(`  ✓ spinAxis derived: ${shot.spinAxis.toFixed(2)} deg`);
+  console.log('  ✓ ProShotInfo player/club context attached');
 }
 
-async function twoShotsBackToBackScenario() {
-  console.log('\n— scenario: two shots back-to-back, both ingested in order —');
-  const watchRoot = makeTempDir();
-  const dataDir = makeTempDir();
-  const lastShot = createLastShotTracker({ dataDir, logger: silentLogger() });
-  const captured = [];
+function envelopeToShotWithNoContextScenario() {
+  console.log('\n— scenario: envelopeToShot — no side context yet (cache empty) —');
 
-  const watcher = createFileWatcher({
-    config: { watch: { shotDataDir: watchRoot, writeStabilityMs: 50, pollIntervalMs: 20 } },
-    logger: silentLogger(),
-    lastShot,
-    onShot: (s) => captured.push(s)
-  });
+  const merged = { ...SHOT_BALL_ENV, BallData: SHOT_BALL_ENV.BallData, ClubData: SHOT_CLUB_ENV.ClubData };
+  const shot = envelopeToShot(merged, null);
 
-  writeShot(watchRoot, 5, SHOTINFO_A, PROINFO_A);
-  writeShot(watchRoot, 6, SHOTINFO_B, PROINFO_B);
-  watcher._processFile(path.join(watchRoot, '5', 'ProShotInfo.json'));
-  watcher._processFile(path.join(watchRoot, '6', 'ProShotInfo.json'));
+  assert.strictEqual(shot.playerName, null);
+  assert.strictEqual(shot.clubId, null);
+  assert.strictEqual(shot.clubName, null);
+  assert.strictEqual(shot.hand, null);
+  // Ball + club kinematics still populated
+  assert.ok(Math.abs(shot.ballSpeed - 95.5933) < 0.001);
+  assert.ok(Math.abs(shot.carryDistance - 122.3272) < 0.001);
 
-  assert.strictEqual(captured.length, 2);
-  assert.strictEqual(captured[0].shotNumber, 5);
-  assert.strictEqual(captured[1].shotNumber, 6);
-  assert.strictEqual(captured[0].clubName, 'IRON7');
-  assert.strictEqual(captured[1].clubName, 'DRIVER');
-  assert.strictEqual(lastShot.read(), 6);
-
-  console.log('  ✓ both shots captured');
-  console.log('  ✓ last-shot advances to highest n');
+  console.log('  ✓ kinematics intact when player context is null');
 }
 
-async function incompleteShotScenario() {
-  console.log('\n— scenario: ProShotInfo present, shotinfo missing — graceful fail —');
-  const watchRoot = makeTempDir();
-  const dataDir = makeTempDir();
-  const lastShot = createLastShotTracker({ dataDir, logger: silentLogger() });
-  const captured = [];
+function extractEnvelopeScenario() {
+  console.log('\n— scenario: extractEnvelope — log line → envelope JSON —');
 
-  const watcher = createFileWatcher({
-    config: { watch: { shotDataDir: watchRoot, writeStabilityMs: 50, pollIntervalMs: 20 } },
-    logger: silentLogger(),
-    lastShot,
-    onShot: (s) => captured.push(s)
-  });
+  const goodLine = '2026-06-14 23:58:51,589 [10] DEBUG VGPconnect.UneekorConForm [(null)] - {"DeviceID":"UNEEKOR EYEXR","Units":"Yards","ShotNumber":42508,"APIversion":"2","BallData":null,"ClubData":null,"ShotDataOptions":null}';
+  const noMarker = '2026-06-14 23:58:51,589 [10] DEBUG something else without the device id marker';
+  const malformed = '2026-06-14 23:58:51,589 [10] DEBUG VGPconnect.UneekorConForm [(null)] - {"DeviceID":"broken JSON';
+  const emptyLine = '';
 
-  const dir = path.join(watchRoot, '7');
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, 'ProShotInfo.json'), JSON.stringify(PROINFO_A));
-  watcher._processFile(path.join(dir, 'ProShotInfo.json'));
+  const env = extractEnvelope(goodLine);
+  assert.ok(env, 'good line parses');
+  assert.strictEqual(env.ShotNumber, 42508);
+  assert.strictEqual(env.DeviceID, 'UNEEKOR EYEXR');
 
-  assert.strictEqual(captured.length, 0, 'no shot captured');
-  assert.strictEqual(lastShot.read(), 0, 'last-shot NOT advanced (so retry can succeed later)');
+  assert.strictEqual(extractEnvelope(noMarker), null);
+  assert.strictEqual(extractEnvelope(malformed), null);
+  assert.strictEqual(extractEnvelope(emptyLine), null);
+  assert.strictEqual(extractEnvelope(null), null);
 
-  console.log('  ✓ missing shotinfo.json rejected without crash');
-  console.log('  ✓ last-shot left at 0 so the next event can retry');
+  // Marker is vendor-agnostic — works for non-Uneekor logger names too
+  const fullSwingLine = '2026-06-14 23:58:51,589 [10] DEBUG VGPconnect.FullSwingConForm [(null)] - {"DeviceID":"FULLSWING-X","Units":"Yards","ShotNumber":1}';
+  const env2 = extractEnvelope(fullSwingLine);
+  assert.ok(env2 && env2.DeviceID === 'FULLSWING-X', 'works for FullSwing logger name');
+
+  console.log('  ✓ valid log line → parsed envelope');
+  console.log('  ✓ non-matching line → null');
+  console.log('  ✓ malformed JSON after marker → null');
+  console.log('  ✓ vendor-agnostic across logger names');
 }
 
-async function referenceShotFilteredScenario() {
-  console.log('\n— scenario: reference shot (Star: true) filtered, last-shot advances —');
-  const watchRoot = makeTempDir();
-  const dataDir = makeTempDir();
-  const lastShot = createLastShotTracker({ dataDir, logger: silentLogger() });
-  const captured = [];
+function reassemblerHappyPathScenario() {
+  console.log('\n— scenario: reassembler — ball + club halves merged once —');
 
-  const watcher = createFileWatcher({
-    config: { watch: { shotDataDir: watchRoot, writeStabilityMs: 50, pollIntervalMs: 20 } },
-    logger: silentLogger(),
-    lastShot,
-    onShot: (s) => captured.push(s)
-  });
+  const emitted = [];
+  const r = createReassembler({ timeoutMs: 1000, sweepIntervalMs: 100, onShot: (m) => emitted.push(m) });
 
-  writeShot(watchRoot, 42, SHOTINFO_A, PROINFO_REFERENCE);
-  watcher._processFile(path.join(watchRoot, '42', 'ProShotInfo.json'));
+  // 4 messages per shot — DEBUG ball, INFO ball (dup), DEBUG club, INFO club (dup)
+  r.feed(SHOT_BALL_ENV);
+  r.feed(SHOT_BALL_ENV);  // INFO duplicate of ball half
+  assert.strictEqual(emitted.length, 0, 'no emit until both halves arrive');
+  r.feed(SHOT_CLUB_ENV);
+  assert.strictEqual(emitted.length, 1, 'emit once both halves present');
+  r.feed(SHOT_CLUB_ENV);  // INFO duplicate of club half — already emitted, no double emit
+  assert.strictEqual(emitted.length, 1, 'duplicate after emit is idempotent');
 
-  assert.strictEqual(captured.length, 0, 'reference shot not delivered');
-  assert.strictEqual(lastShot.read(), 42, 'last-shot advances past the demo dir');
+  const merged = emitted[0];
+  assert.ok(merged.BallData && merged.BallData.Speed === 95.59339655410767, 'ball half present');
+  assert.ok(merged.ClubData && merged.ClubData.Speed === 69.60, 'club half present');
+  assert.strictEqual(merged.ShotNumber, 42508);
 
-  console.log('  ✓ Star: true shot suppressed');
-  console.log('  ✓ counter advanced so we don\'t re-evaluate it');
+  r.stop();
+  console.log('  ✓ ball + club merged into one envelope');
+  console.log('  ✓ DEBUG+INFO duplicates collapse — exactly one emit per shot');
 }
 
-async function restartResumeScenario() {
-  console.log('\n— scenario: restart resumes from last-shot.json (no double-ingest) —');
-  const watchRoot = makeTempDir();
-  const dataDir = makeTempDir();
+function reassemblerHeartbeatScenario() {
+  console.log('\n— scenario: reassembler — heartbeats skipped —');
 
-  fs.writeFileSync(
-    path.join(dataDir, 'last-shot.json'),
-    JSON.stringify({ n: 100, updated_at: new Date().toISOString() })
-  );
+  const emitted = [];
+  const r = createReassembler({ timeoutMs: 1000, sweepIntervalMs: 100, onShot: (m) => emitted.push(m) });
 
-  const lastShot = createLastShotTracker({ dataDir, logger: silentLogger() });
-  assert.strictEqual(lastShot.read(), 100);
+  r.feed(HEARTBEAT_ENV);
+  r.feed(HEARTBEAT_ENV);
+  r.feed(HEARTBEAT_ENV);
+  assert.strictEqual(emitted.length, 0, 'heartbeats never emit');
+  assert.strictEqual(r._pending().size, 0, 'heartbeats never enter pending');
 
-  const captured = [];
-  const watcher = createFileWatcher({
-    config: { watch: { shotDataDir: watchRoot, writeStabilityMs: 50, pollIntervalMs: 20 } },
-    logger: silentLogger(),
-    lastShot,
-    onShot: (s) => captured.push(s)
-  });
-
-  writeShot(watchRoot, 99,  SHOTINFO_A, PROINFO_A);
-  writeShot(watchRoot, 100, SHOTINFO_A, PROINFO_A);
-  writeShot(watchRoot, 101, SHOTINFO_B, PROINFO_B);
-
-  watcher._processFile(path.join(watchRoot, '99',  'ProShotInfo.json'));
-  watcher._processFile(path.join(watchRoot, '100', 'ProShotInfo.json'));
-  watcher._processFile(path.join(watchRoot, '101', 'ProShotInfo.json'));
-
-  assert.strictEqual(captured.length, 1, 'only the n > last-seen shot delivered');
-  assert.strictEqual(captured[0].shotNumber, 101);
-  assert.strictEqual(lastShot.read(), 101);
-
-  console.log('  ✓ shots n ≤ last-seen skipped');
-  console.log('  ✓ only the new shot delivered');
+  r.stop();
+  console.log('  ✓ IsHeartBeat: true envelopes ignored');
+  console.log('  ✓ pending map never sees heartbeats');
 }
 
-async function chokidarLiveScenario() {
-  console.log('\n— scenario: real chokidar fires on ProShotInfo close —');
-  const watchRoot = makeTempDir();
-  const dataDir = makeTempDir();
-  const lastShot = createLastShotTracker({ dataDir, logger: silentLogger() });
-  const captured = [];
+async function reassemblerPartialTimeoutScenario() {
+  console.log('\n— scenario: reassembler — ball-only times out and emits partial —');
 
-  const watcher = createFileWatcher({
-    config: { watch: { shotDataDir: watchRoot, writeStabilityMs: 80, pollIntervalMs: 30 } },
+  const emitted = [];
+  const r = createReassembler({ timeoutMs: 100, sweepIntervalMs: 30, onShot: (m) => emitted.push(m) });
+  r.start();
+
+  r.feed(SHOT_BALL_ENV);
+  assert.strictEqual(emitted.length, 0, 'no immediate emit on ball-only');
+  await sleep(300);
+  assert.strictEqual(emitted.length, 1, 'partial emitted after timeout');
+  const merged = emitted[0];
+  assert.ok(merged.BallData && merged.BallData.Speed === 95.59339655410767, 'ball data preserved in partial');
+  assert.strictEqual(merged.ClubData, null, 'club data null in partial');
+
+  r.stop();
+  console.log('  ✓ partial shot emitted after timeoutMs');
+  console.log('  ✓ ball data preserved, club data null');
+}
+
+function reassemblerIndependentShotsScenario() {
+  console.log('\n— scenario: reassembler — multiple ShotNumbers tracked independently —');
+
+  const emitted = [];
+  const r = createReassembler({ timeoutMs: 1000, sweepIntervalMs: 100, onShot: (m) => emitted.push(m) });
+
+  // Interleave halves of two shots
+  r.feed(SHOT_BALL_ENV);
+  r.feed(SHOT2_BALL_ENV);
+  assert.strictEqual(emitted.length, 0);
+  r.feed(SHOT_CLUB_ENV);
+  assert.strictEqual(emitted.length, 1, 'first shot emits when its halves complete');
+  assert.strictEqual(emitted[0].ShotNumber, 42508);
+  r.feed(SHOT2_CLUB_ENV);
+  assert.strictEqual(emitted.length, 2, 'second shot emits independently');
+  assert.strictEqual(emitted[1].ShotNumber, 42509);
+
+  r.stop();
+  console.log('  ✓ shot 42508 and 42509 tracked independently');
+  console.log('  ✓ interleaved halves still emit correctly');
+}
+
+function spinDerivationScenario() {
+  console.log('\n— scenario: spin axis + total spin derivation —');
+
+  assert.strictEqual(deriveTotalSpin(null, 100), null);
+  assert.strictEqual(deriveTotalSpin(0, 0), 0);
+  assert.ok(Math.abs(deriveTotalSpin(7000, -1500) - Math.hypot(7000, -1500)) < 0.001);
+
+  assert.strictEqual(deriveSpinAxis(0, 0), null);
+  assert.strictEqual(deriveSpinAxis(null, 100), null);
+  // Pure backspin → axis 0
+  assert.ok(Math.abs(deriveSpinAxis(5000, 0) - 0) < 0.001);
+  // Pure sideSpin positive → +90deg
+  assert.ok(Math.abs(deriveSpinAxis(0, 5000) - 90) < 0.001);
+  // Both populated → arctan in degrees
+  const axis = deriveSpinAxis(7000, -1500);
+  assert.ok(axis < 0 && axis > -90, `arctan(-1500/7000) in deg should be -12.1ish, got ${axis}`);
+
+  console.log('  ✓ totalSpin = hypot(back, side) when both present');
+  console.log('  ✓ spinAxis = atan2(side, back) * 180/π in degrees');
+  console.log('  ✓ null inputs propagate cleanly');
+}
+
+// ─── Side-watcher scenarios ──────────────────────────────────────────────
+
+async function sideWatcherPreCacheScenario() {
+  console.log('\n— scenario: ProShotInfo side-watcher — pre-cache from existing dir —');
+
+  const watchRoot = makeTempDir();
+  writeProShotInfo(watchRoot, 100, PROSHOTINFO_A);
+  writeProShotInfo(watchRoot, 99, { Name: "OldUser", Club: 1, ClubName: "DRIVER", Star: false, Hand: 0 });
+
+  const sw = createProShotInfoSideWatcher({
+    config: { watch: { shotDataDir: watchRoot } },
     logger: silentLogger(),
-    lastShot,
-    onShot: (s) => captured.push(s)
+    staleMs: 60000,
   });
 
-  await watcher.start();
-  writeShot(watchRoot, 11, SHOTINFO_A, PROINFO_A);
+  await sw.start();
+  const cached = sw.get();
+  assert.ok(cached, 'cache populated on startup');
+  assert.strictEqual(cached.Name, 'ClubHouse', 'pre-cached from highest n (100)');
+  assert.strictEqual(cached.ClubName, 'IRON7');
 
+  await sw.stop();
+  console.log('  ✓ on start, pre-caches from highest existing ProShotInfo');
+}
+
+async function sideWatcherUpdateScenario() {
+  console.log('\n— scenario: ProShotInfo side-watcher — updates on new file event —');
+
+  const watchRoot = makeTempDir();
+  const sw = createProShotInfoSideWatcher({
+    config: { watch: { shotDataDir: watchRoot } },
+    logger: silentLogger(),
+    staleMs: 60000,
+  });
+
+  await sw.start();
+  assert.strictEqual(sw.get(), null, 'cache empty when no ProShotInfo exists yet');
+
+  writeProShotInfo(watchRoot, 200, PROSHOTINFO_A);
+
+  // Poll for chokidar to pick up the new file
   const start = Date.now();
-  while (captured.length === 0 && Date.now() - start < 3000) await sleep(50);
-  await watcher.stop();
+  while (sw.get() == null && Date.now() - start < 2000) await sleep(50);
 
-  assert.strictEqual(captured.length, 1, `expected 1 shot via chokidar, got ${captured.length}`);
-  assert.strictEqual(captured[0].shotNumber, 11);
-  console.log(`  ✓ chokidar delivered shot in ${Date.now() - start}ms`);
+  const cached = sw.get();
+  assert.ok(cached, 'cache populated after new file write');
+  assert.strictEqual(cached.Name, 'ClubHouse');
+
+  await sw.stop();
+  console.log(`  ✓ chokidar picked up new ProShotInfo in ${Date.now() - start}ms`);
 }
 
-async function coldStartSkipsHistoryScenario() {
-  console.log('\n— scenario: cold start skips VIEW lifetime history —');
-  const watchRoot = makeTempDir();
-  const dataDir = makeTempDir();
+async function sideWatcherReferenceShotScenario() {
+  console.log('\n— scenario: ProShotInfo side-watcher — Star: true demos suppressed —');
 
-  // Pre-populate the watch dir with VIEW's historical shots (mimicking what
-  // the Bay 2 PC had on first install — n=929..993 with gaps).
-  for (const n of [929, 950, 980, 993]) {
-    writeShot(watchRoot, n, SHOTINFO_A, PROINFO_A);
+  const watchRoot = makeTempDir();
+  writeProShotInfo(watchRoot, 50, PROSHOTINFO_A);  // real shot
+  writeProShotInfo(watchRoot, 60, PROSHOTINFO_REFERENCE);  // demo, higher n
+
+  const sw = createProShotInfoSideWatcher({
+    config: { watch: { shotDataDir: watchRoot } },
+    logger: silentLogger(),
+    staleMs: 60000,
+  });
+
+  await sw.start();
+  const cached = sw.get();
+  assert.ok(cached, 'cache populated (from real shot 50, not demo 60)');
+  assert.strictEqual(cached.Name, 'ClubHouse', 'real shot wins over demo');
+
+  await sw.stop();
+  console.log('  ✓ Star: true demo shots skipped by pre-cache scan');
+}
+
+function sideWatcherStaleScenario() {
+  console.log('\n— scenario: ProShotInfo side-watcher — staleness expiry —');
+
+  const sw = createProShotInfoSideWatcher({
+    config: { watch: { shotDataDir: makeTempDir() } },
+    logger: silentLogger(),
+    staleMs: 1,  // immediately stale
+  });
+
+  sw._setCacheForTesting(PROSHOTINFO_A);
+  // Sleep slightly so the cached timestamp is older than staleMs
+  const after = Date.now() + 5;
+  while (Date.now() < after) { /* spin briefly */ }
+  assert.strictEqual(sw.get(), null, 'cache returns null when stale');
+
+  console.log('  ✓ cache returns null past staleMs');
+}
+
+// ─── End-to-end: fixture log file → reassembler → shots ─────────────────
+
+async function fixtureLogEndToEndScenario() {
+  console.log('\n— scenario: end-to-end — fixture log lines → parser → reassembler → shots —');
+
+  const logPath = path.join(__dirname, 'fixtures', 'connect-debug-sample.log');
+  const lines = fs.readFileSync(logPath, 'utf8').split('\n').filter(Boolean);
+
+  const emitted = [];
+  // Short timeout — we want partials to sweep promptly after feed.
+  const r = createReassembler({ timeoutMs: 30, sweepIntervalMs: 100, onShot: (m) => emitted.push(m) });
+
+  let envelopesParsed = 0;
+  for (const line of lines) {
+    const env = extractEnvelope(line);
+    if (env == null) continue;
+    envelopesParsed++;
+    r.feed(env);
   }
 
-  const lastShot = createLastShotTracker({ dataDir, logger: silentLogger() });
-  assert.strictEqual(lastShot.read(), 0, 'no last-shot.json yet, read returns 0');
+  // Let the timeout elapse, then sweep to flush partials.
+  await sleep(80);
+  r.sweep();
+  r.stop();
 
-  const captured = [];
-  const watcher = createFileWatcher({
-    config: { watch: { shotDataDir: watchRoot, writeStabilityMs: 50, pollIntervalMs: 20 } },
-    logger: silentLogger(),
-    lastShot,
-    onShot: (s) => captured.push(s)
-  });
+  // The fixture has:
+  // - 2 heartbeat envelopes (skipped by reassembler at feed-time)
+  // - 4 envelopes for shot 42508 (DEBUG ball + INFO ball + DEBUG club + INFO club) → 1 emit
+  // - 1 envelope for shot 42509 (DEBUG ball only) → 1 emit after sweep
+  // = 7 envelopes parsed, 2 shots emitted (1 complete + 1 partial)
+  assert.strictEqual(envelopesParsed, 7, `parsed ${envelopesParsed} envelopes`);
+  assert.strictEqual(emitted.length, 2, `emitted ${emitted.length} shots`);
 
-  await watcher.start();
-  await sleep(150);     // give chokidar time to settle — none of the historical shots should fire
+  const shot42508 = emitted.find((m) => m.ShotNumber === 42508);
+  assert.ok(shot42508, 'shot 42508 emitted');
+  assert.ok(shot42508.BallData && shot42508.BallData.Speed === 95.59339655410767);
+  assert.ok(shot42508.ClubData && shot42508.ClubData.Speed === 69.60);
 
-  assert.strictEqual(captured.length, 0, 'no historical shots backfilled on cold start');
-  assert.strictEqual(lastShot.read(), 993, 'last-shot initialized to max existing n');
+  const shot42509 = emitted.find((m) => m.ShotNumber === 42509);
+  assert.ok(shot42509, 'shot 42509 emitted (partial after sweep)');
+  assert.ok(shot42509.BallData && shot42509.BallData.Speed === 112.7);
+  assert.strictEqual(shot42509.ClubData, null, 'shot 42509 partial — no club data');
 
-  // A fresh shot above 993 should fire normally now.
-  writeShot(watchRoot, 994, SHOTINFO_B, PROINFO_B);
-  const start = Date.now();
-  while (captured.length === 0 && Date.now() - start < 3000) await sleep(50);
-  await watcher.stop();
-
-  assert.strictEqual(captured.length, 1, 'new shot after cold-start IS delivered');
-  assert.strictEqual(captured[0].shotNumber, 994);
-  assert.strictEqual(lastShot.read(), 994);
-
-  console.log('  ✓ 4 historical shots skipped');
-  console.log('  ✓ last-shot initialized to 993 (current max)');
-  console.log('  ✓ subsequent new shot fired normally');
+  console.log(`  ✓ parsed ${envelopesParsed} envelopes from fixture (6 envelope lines + 2 non-matches)`);
+  console.log('  ✓ shot 42508 emitted with both halves');
+  console.log('  ✓ shot 42509 emitted as partial after sweep');
 }
 
-async function warmStartCatchesUpScenario() {
-  console.log('\n— scenario: warm start catches up shots written during downtime —');
-  const watchRoot = makeTempDir();
-  const dataDir = makeTempDir();
-
-  // Pre-existing last-shot cursor at 100.
-  fs.writeFileSync(
-    path.join(dataDir, 'last-shot.json'),
-    JSON.stringify({ n: 100, updated_at: new Date().toISOString() })
-  );
-
-  // Shots that landed during downtime: some above the cursor (catch up), some below (skip).
-  writeShot(watchRoot, 95,  SHOTINFO_A, PROINFO_A);
-  writeShot(watchRoot, 102, SHOTINFO_A, PROINFO_A);
-  writeShot(watchRoot, 104, SHOTINFO_B, PROINFO_B);
-
-  const lastShot = createLastShotTracker({ dataDir, logger: silentLogger() });
-  assert.strictEqual(lastShot.read(), 100);
-
-  const captured = [];
-  const watcher = createFileWatcher({
-    config: { watch: { shotDataDir: watchRoot, writeStabilityMs: 50, pollIntervalMs: 20 } },
-    logger: silentLogger(),
-    lastShot,
-    onShot: (s) => captured.push(s)
-  });
-
-  await watcher.start();
-  await sleep(100);
-  await watcher.stop();
-
-  assert.strictEqual(captured.length, 2, 'two missed shots caught up');
-  assert.deepStrictEqual(
-    captured.map((s) => s.shotNumber).sort((a, b) => a - b),
-    [102, 104]
-  );
-  assert.strictEqual(lastShot.read(), 104);
-
-  console.log('  ✓ above-cursor shots caught up in numeric order');
-  console.log('  ✓ below-cursor shot skipped');
-  console.log('  ✓ last-shot advanced to highest caught-up n');
-}
-
-function ballisticScenario() {
-  console.log('\n— scenario: ballistic carry computation produces plausible values —');
-
-  // PGA-tour driver: 165 mph ball, 11° launch, 2600 rpm → expect ~220–320 yd.
-  const driver = computeCarryYards({ ballSpeedMph: 165, vlaDeg: 11, backspinRpm: 2600 });
-  assert.ok(driver > 200 && driver < 340, `driver carry ${driver?.toFixed(1)} should be 200–340 yd`);
-
-  // Full 7-iron: 120 mph ball, 18° launch, 7000 rpm → expect ~140–200 yd.
-  const fullIron = computeCarryYards({ ballSpeedMph: 120, vlaDeg: 18, backspinRpm: 7000 });
-  assert.ok(fullIron > 120 && fullIron < 220, `full iron carry ${fullIron?.toFixed(1)} should be 120–220 yd`);
-
-  // The actual bay sample shot, in corrected units: 45.08 m/s = 100.82 mph (full 7-iron),
-  // 19.8° launch, ~8340 rpm. Real-world reference: Liam reported 155 yd carry on the
-  // simulator for a similar swing — model should land in that ballpark.
-  const bayShot = computeCarryYards({ ballSpeedMph: 45.08 * MPH_PER_MS, vlaDeg: 19.7957, backspinRpm: 8337.92 });
-  assert.ok(bayShot > 80 && bayShot < 200, `bay 7-iron carry ${bayShot?.toFixed(1)} should be 80–200 yd`);
-
-  // Bad inputs → null, not NaN
-  assert.strictEqual(computeCarryYards({ ballSpeedMph: NaN, vlaDeg: 10, backspinRpm: 2000 }), null);
-  assert.strictEqual(computeCarryYards({ ballSpeedMph: 100, vlaDeg: -5, backspinRpm: 2000 }), null);
-
-  console.log(`  ✓ driver model: ${driver.toFixed(1)} yd`);
-  console.log(`  ✓ full 7-iron model: ${fullIron.toFixed(1)} yd`);
-  console.log(`  ✓ bay sample 7-iron (100.82 mph): ${bayShot.toFixed(1)} yd`);
-  console.log('  ✓ NaN / negative launch return null');
-}
-
-// ─── fake servers (reused across M2 + M3) ───────────────────────────────
+// ─── fake servers (reused) ──────────────────────────────────────────────
 
 function fakeSupabase({ port }) {
   return new Promise((resolve) => {
@@ -540,7 +577,7 @@ function fakeSupabase({ port }) {
       resolve({
         url: `http://127.0.0.1:${server.address().port}`,
         requests, state,
-        close: () => new Promise((r) => server.close(() => r()))
+        close: () => new Promise((r) => server.close(() => r())),
       });
     });
   });
@@ -575,7 +612,7 @@ function fakeOptix({ port, state }) {
       resolve({
         url: `http://127.0.0.1:${server.address().port}/graphql`,
         requests, state,
-        close: () => new Promise((r) => server.close(() => r()))
+        close: () => new Promise((r) => server.close(() => r())),
       });
     });
   });
@@ -590,30 +627,35 @@ function makeBooking({ booking_id, user_id = '762951', email = 'kyle@example.com
     is_canceled:     false,
     account: { account_id },
     user:    { user_id, email, fullname },
-    resource: { resource_id: '609902' }
+    resource: { resource_id: '609902' },
   };
 }
 
-// ─── M2 scenarios — Supabase POST + JSONL with VIEW shape ───────────────
+function buildSampleShot() {
+  const merged = { ...SHOT_BALL_ENV, BallData: SHOT_BALL_ENV.BallData, ClubData: SHOT_CLUB_ENV.ClubData };
+  return envelopeToShot(merged, PROSHOTINFO_A);
+}
+
+// ─── M2 scenarios — Supabase POST + JSONL ───────────────────────────────
 
 async function supabasePostScenario() {
-  console.log('\n— scenario: shot POSTed to supabase with VIEW-mapped columns —');
+  console.log('\n— scenario: shot POSTed to supabase with Connect-envelope columns —');
   const dataDir = makeTempDir();
   const supa = await fakeSupabase({ port: await getFreePort() });
   const config = {
     bay: { number: 2, optixResourceId: '619992' },
+    connect: { logPath: '/dev/null' },
     watch: { shotDataDir: makeTempDir() },
     supabase: { url: supa.url, serviceKey: 'fake-service-role-key', shotsTable: 'shots' },
     session: { inactivityTimeoutMs: 600000 },
-    logging: { level: 'info' }
+    logging: { level: 'info' },
   };
 
   const persistence = createPersistence({ config, logger: silentLogger(), dataDir });
   const health = await persistence.healthCheck();
   assert.strictEqual(health.ok, true);
 
-  const shot = buildSampleShot(SHOTINFO_A, PROINFO_A, 1);
-  persistence.saveShot(shot);
+  persistence.saveShot(buildSampleShot());
   await sleep(200);
   await persistence.close();
   await supa.close();
@@ -624,27 +666,27 @@ async function supabasePostScenario() {
   assert.strictEqual(inserts[0].headers['apikey'], 'fake-service-role-key');
   assert.strictEqual(inserts[0].headers['authorization'], 'Bearer fake-service-role-key');
   assert.strictEqual(inserts[0].headers['prefer'], 'return=minimal');
+
+  // VIEW-shape values are GONE — these come straight from Connect
   assert.strictEqual(body.bay_number, 2);
-  assert.strictEqual(body.session_id, null);
-  assert.strictEqual(body.player_id, null);
-  assert.strictEqual(body.shot_number, 1);
-  // ball_speed in DB is mph after the m/s → mph conversion in the parser.
-  assert.ok(Math.abs(body.ball_speed - 45.08 * MPH_PER_MS) < 0.01,
-    `ball_speed should be in mph, got ${body.ball_speed}`);
-  assert.ok(Math.abs(body.vla - 19.7957) < 0.001, 'incline → vla');
-  assert.ok(Math.abs(body.hla - 0.306) < 0.001, 'azimuth → hla');
-  assert.strictEqual(body.club, 'IRON7', 'ClubName → club column');
-  assert.strictEqual(body.club_id, 24, 'Club → club_id');
+  assert.strictEqual(body.shot_number, 42508);
+  assert.ok(Math.abs(body.ball_speed - 95.5933) < 0.001, 'ball_speed direct from Connect');
+  assert.ok(Math.abs(body.carry_distance - 122.3272) < 0.001, 'carry_distance direct from Connect (NOT ballistic)');
+  assert.ok(Math.abs(body.club_speed - 69.60) < 0.001);
+  assert.strictEqual(body.back_spin, 4521);
+  assert.strictEqual(body.side_spin, -188);
+  assert.strictEqual(body.speed_at_impact, 69.60);
+  assert.ok(body.total_spin > 0, 'total_spin derived from back+side spins');
+  assert.strictEqual(body.club, 'IRON7', 'ClubName from ProShotInfo side-watcher');
+  assert.strictEqual(body.club_id, 24);
   assert.strictEqual(body.hand, 0);
-  assert.ok(body.assurance && body.assurance.clubSpeed === 89, 'assurance JSONB carries through');
-  assert.ok(body.carry_distance != null && body.carry_distance > 0, 'carry computed by ballistic model');
-  assert.ok(body.raw.shotinfo, 'raw contains shotinfo');
-  assert.ok(body.raw.proShotInfo, 'raw contains ProShotInfo');
+  assert.ok(body.raw && body.raw.ShotNumber === 42508, 'raw envelope preserved');
 
   console.log('  ✓ apikey + Bearer headers on POST');
-  console.log('  ✓ VIEW fields mapped to schema columns (ballspeed/incline/azimuth → ball_speed/vla/hla)');
-  console.log(`  ✓ carry_distance computed Mac-side (${body.carry_distance} yd)`);
-  console.log('  ✓ assurance JSONB persisted, raw contains both source JSONs');
+  console.log(`  ✓ ball_speed = ${body.ball_speed} mph (direct from Connect)`);
+  console.log(`  ✓ carry_distance = ${body.carry_distance} yd (direct from Connect, NOT ballistic)`);
+  console.log(`  ✓ back_spin + side_spin = ${body.back_spin} + ${body.side_spin} rpm (new columns)`);
+  console.log(`  ✓ speed_at_impact = ${body.speed_at_impact} mph (new column)`);
 }
 
 async function supabaseDownStartupScenario() {
@@ -653,16 +695,17 @@ async function supabaseDownStartupScenario() {
   const deadPort = await getFreePort();
   const config = {
     bay: { number: 1, optixResourceId: '609902' },
+    connect: { logPath: '/dev/null' },
     watch: { shotDataDir: makeTempDir() },
     supabase: { url: `http://127.0.0.1:${deadPort}`, serviceKey: 'fake-key', shotsTable: 'shots' },
     session: { inactivityTimeoutMs: 600000 },
-    logging: { level: 'info' }
+    logging: { level: 'info' },
   };
   const persistence = createPersistence({ config, logger: silentLogger(), dataDir });
   const health = await persistence.healthCheck();
   assert.strictEqual(health.ok, false);
 
-  persistence.saveShot(buildSampleShot(SHOTINFO_A, PROINFO_A, 1));
+  persistence.saveShot(buildSampleShot());
   await sleep(150);
   await persistence.close();
 
@@ -681,11 +724,12 @@ async function setupM3() {
   const supa  = await fakeSupabase({ port: await getFreePort() });
   const config = {
     bay: { number: 1, optixResourceId: '609902' },
+    connect: { logPath: '/dev/null' },
     watch: { shotDataDir: makeTempDir() },
     supabase: { url: supa.url, serviceKey: 'fake-key', shotsTable: 'shots' },
     optix:    { graphqlUrl: optix.url, orgToken: 'fake-org-tokeno', pollIntervalMs: 60000, fetchTimeoutMs: 5000 },
     session:  { inactivityTimeoutMs: 600000, backfillWindowMs: 60000 },
-    logging:  { level: 'info' }
+    logging:  { level: 'info' },
   };
   const logger = silentLogger();
   const supabase = createSupabaseClient({ config, logger });
@@ -771,7 +815,7 @@ async function inactivityScenario() {
   ctx.config.session.inactivityTimeoutMs = 200;
   await ctx.sessionManager.stop();
   ctx.sessionManager = createSessionManager({
-    config: ctx.config, logger: ctx.logger, optixClient: ctx.optixClient, supabase: ctx.supabase
+    config: ctx.config, logger: ctx.logger, optixClient: ctx.optixClient, supabase: ctx.supabase,
   });
   ctx.optixState.currentByResource['609902'] = makeBooking({ booking_id: 'bk-i' });
   await ctx.sessionManager._runPollOnce();
@@ -807,12 +851,12 @@ async function restartResumeOptixScenario() {
   const ctx = await setupM3();
   ctx.supa.state.players.push({
     id: 'player-existing', optix_user_id: '762951', optix_member_id: '449823',
-    email: 'kyle@example.com', display_name: 'Kyle Peterson'
+    email: 'kyle@example.com', display_name: 'Kyle Peterson',
   });
   ctx.supa.state.sessions.push({
     id: 'session-existing', player_id: 'player-existing', bay_number: 1,
     optix_booking_id: 'bk-r', started_at: new Date(Date.now() - 30 * 60 * 1000).toISOString(),
-    ended_at: null, shot_count: 0
+    ended_at: null, shot_count: 0,
   });
   ctx.optixState.currentByResource['609902'] = makeBooking({ booking_id: 'bk-r' });
   await ctx.sessionManager._runPollOnce();
@@ -836,9 +880,9 @@ async function shotTaggingScenario() {
   const persistence = createPersistence({
     config: ctx.config, logger: ctx.logger, dataDir,
     supabase: ctx.supabase,
-    getTag: () => ctx.sessionManager.getCurrentTag()
+    getTag: () => ctx.sessionManager.getCurrentTag(),
   });
-  persistence.saveShot(buildSampleShot(SHOTINFO_A, PROINFO_A, 200));
+  persistence.saveShot(buildSampleShot());
   ctx.sessionManager.noteShot();
   await sleep(150);
 
@@ -856,18 +900,22 @@ async function shotTaggingScenario() {
 
 (async () => {
   try {
-    // M1 — parser + watcher + ballistic
-    await singleShotScenario();
-    await twoShotsBackToBackScenario();
-    await incompleteShotScenario();
-    await referenceShotFilteredScenario();
-    await restartResumeScenario();
-    await chokidarLiveScenario();
-    await coldStartSkipsHistoryScenario();
-    await warmStartCatchesUpScenario();
-    ballisticScenario();
+    // M1 — Connect log parsing + reassembly + envelope → shot record
+    envelopeToShotScenario();
+    envelopeToShotWithNoContextScenario();
+    extractEnvelopeScenario();
+    reassemblerHappyPathScenario();
+    reassemblerHeartbeatScenario();
+    await reassemblerPartialTimeoutScenario();
+    reassemblerIndependentShotsScenario();
+    spinDerivationScenario();
+    await sideWatcherPreCacheScenario();
+    await sideWatcherUpdateScenario();
+    await sideWatcherReferenceShotScenario();
+    sideWatcherStaleScenario();
+    await fixtureLogEndToEndScenario();
 
-    // M2 — Supabase + JSONL with VIEW-shaped rows
+    // M2 — Supabase + JSONL with Connect-shaped rows
     await supabasePostScenario();
     await supabaseDownStartupScenario();
 

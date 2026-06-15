@@ -6,7 +6,7 @@ function loadConfig(configPath) {
   if (!fs.existsSync(resolved)) {
     throw new Error(
       `Config file not found: ${resolved}\n` +
-        `Copy config.example.json to config.json and fill in bay number + watch.shotDataDir.`
+        `Copy config.example.json to config.json and fill in bay number, connect.logPath, and watch.shotDataDir.`
     );
   }
 
@@ -28,20 +28,21 @@ function validateConfig(c) {
   req(c.bay && Number.isInteger(c.bay.number), 'bay.number must be an integer');
   req(c.bay && typeof c.bay.optixResourceId === 'string', 'bay.optixResourceId must be a string');
 
+  // Primary ingress: tail GSPconnect's debug log.
+  req(
+    c.connect && typeof c.connect.logPath === 'string' && c.connect.logPath.length > 0,
+    'connect.logPath must be a non-empty string (path to GSPconnect ConnectDebug.txt)'
+  );
+
+  // Side ingress: chokidar on VIEW's ShotData for player/club/hand context.
   req(
     c.watch && typeof c.watch.shotDataDir === 'string' && c.watch.shotDataDir.length > 0,
     'watch.shotDataDir must be a non-empty string (path to VIEW ShotData directory)'
   );
-  if (c.watch && c.watch.writeStabilityMs !== undefined) {
+  if (c.watch && c.watch.proShotInfoStaleMs !== undefined) {
     req(
-      Number.isInteger(c.watch.writeStabilityMs) && c.watch.writeStabilityMs >= 0,
-      'watch.writeStabilityMs must be a non-negative integer'
-    );
-  }
-  if (c.watch && c.watch.pollIntervalMs !== undefined) {
-    req(
-      Number.isInteger(c.watch.pollIntervalMs) && c.watch.pollIntervalMs >= 10,
-      'watch.pollIntervalMs must be an integer >= 10'
+      Number.isInteger(c.watch.proShotInfoStaleMs) && c.watch.proShotInfoStaleMs >= 0,
+      'watch.proShotInfoStaleMs must be a non-negative integer'
     );
   }
 

@@ -3,44 +3,39 @@
 const fs = require('fs');
 const path = require('path');
 const { createSupabaseClient } = require('./supabase');
-const { computeCarryYards } = require('./ballistic');
 
 const SHOTS_FILE = 'shots.jsonl';
 
-// Maps the unified VIEW shot record (produced by src/view-parser.js) onto the
-// Supabase `shots` columns. Naming convention is whatever was already there
-// from the original GS Pro Connect schema — hla/vla/attack_angle/path/etc —
-// even though the VIEW field names are different. Same physical quantities.
+// Maps the unified shot record (produced by src/gspro-parser.js from a
+// merged Connect envelope) onto the Supabase `shots` columns. All values
+// arrive already in display units (mph, yards, deg, rpm) — Connect did the
+// translation. The relay does direct field copies; no unit conversion, no
+// ballistic compute.
 function flattenShot(shot) {
   const pick = (v) => (v === undefined ? null : v);
   if (!shot) return {};
 
-  let carry = null;
-  if (shot.ballSpeed != null && shot.vla != null && shot.backspin != null) {
-    const c = computeCarryYards({
-      ballSpeedMph: shot.ballSpeed,
-      vlaDeg: shot.vla,
-      backspinRpm: shot.backspin
-    });
-    if (c != null) carry = Math.round(c * 10) / 10;
-  }
-
   return {
     shot_number:    pick(shot.shotNumber),
+    // Ball kinematics
     ball_speed:     pick(shot.ballSpeed),
     spin_axis:      pick(shot.spinAxis),
     total_spin:     pick(shot.totalSpin),
+    back_spin:      pick(shot.backSpin),
+    side_spin:      pick(shot.sideSpin),
     hla:            pick(shot.hla),
     vla:            pick(shot.vla),
-    carry_distance: carry,
-    club_speed:     pick(shot.clubSpeed),
-    face_to_target: pick(shot.faceAngle),
-    attack_angle:   pick(shot.attackAngle),
-    path:           pick(shot.clubPath),
-    club:           pick(shot.clubName),    // existing text column repurposed
+    carry_distance: pick(shot.carryDistance),       // direct from Connect, no ballistic
+    // Club kinematics
+    club_speed:        pick(shot.clubSpeed),
+    speed_at_impact:   pick(shot.speedAtImpact),
+    face_to_target:    pick(shot.faceAngle),
+    attack_angle:      pick(shot.attackAngle),
+    path:              pick(shot.clubPath),
+    // Club + player context (from ProShotInfo side-watcher cache)
+    club:           pick(shot.clubName),
     club_id:        pick(shot.clubId),
     hand:           pick(shot.hand),
-    assurance:      pick(shot.assurance)
   };
 }
 
@@ -51,7 +46,7 @@ function buildShotRow({ shot, bayNumber, tag }) {
     bay_number: bayNumber,
     ...flattenShot(shot),
     raw: (shot && shot.raw) ? shot.raw : shot,
-    recorded_at: new Date().toISOString()
+    recorded_at: new Date().toISOString(),
   };
 }
 
@@ -105,7 +100,7 @@ function createPersistence({ config, logger, dataDir, supabase, getTag }) {
     close,
     shotsPath,
     healthCheck: supa.healthCheck.bind(supa),
-    supabaseEnabled: supa.enabled
+    supabaseEnabled: supa.enabled,
   };
 }
 

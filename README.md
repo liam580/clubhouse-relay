@@ -1,9 +1,10 @@
-# Clubhouse VIEW Shot Relay
+# Clubhouse Shot Relay
 
-A Node.js service that watches Uneekor VIEW's per-shot JSON output, parses each shot, computes carry from a ballistic model, and saves it to Supabase tagged with the active Optix booking's player and session.
+A Node.js service that tails GSPconnect's `ConnectDebug.txt` for each shot's GS Pro Open Connect envelope, attaches player/club context from VIEW's `ProShotInfo.json`, and saves to Supabase tagged with the active Optix booking's session and player.
 
-**Status:** M1 (file-watch + parser + ballistic) ✓, M2 (Supabase) ✓, M3 (Optix session tagging) ✓.
+**Status:** M1 (Connect log tail + parser + reassembler) ✓, M2 (Supabase) ✓, M3 (Optix session tagging) ✓.
 - Each shot fires a row to `data/shots.jsonl` (durable local backup) and to Supabase when configured.
+- All velocity + distance fields arrive **already in display units** (mph, yards, deg, rpm). The relay does direct field copies — no unit conversion, no ballistic model. Carry distance comes straight from the Connect envelope.
 - The relay polls Optix every 30 s for the active booking on this bay's resource. When a booking is in progress it upserts a `players` row, opens a `sessions` row, tags every shot in real time with `session_id` + `player_id`, and backfills the previous 60 s of NULL-tagged shots. Sessions close when the booking ends (poll returns nothing) or after 10 min of no shots (safety net).
 - The 30-second poll lag at session start is covered by the 60-second backfill — warm-up shots get retroactively attributed.
 
@@ -12,25 +13,31 @@ A Node.js service that watches Uneekor VIEW's per-shot JSON output, parses each 
 ## How it fits
 
 ```
-Uneekor VIEW ──writes──▶  ShotData/<n>/{shotinfo.json,
-                                          ProShotInfo.json,
-                                          imageinfo.xml, *.jpg}
-                              │
-                              │  ProShotInfo.json closes last (~9 s after the JPG burst)
-                              ▼
-                          Relay (this app)
-                              │
-                              ├── append → data/shots.jsonl
-                              │
-                              └── insert → Supabase `shots`
-                                    (with session_id + player_id when a booking is active)
+Uneekor hardware ──vendor-native──▶  GSPconnect.exe ──Open Connect JSON──▶  GS Pro (:9050)
+                                          │                                         │
+                                          │ log4net mirrors outgoing JSON           │
+                                          ▼                                         │
+                          C:\GSProV1\Core\GSPC\ConnectDebug.txt                      │
+                                          │                                         │
+                                          │  (tail)                                 │
+                                          ▼                                         │
+                                Relay (this app)        ◀──ProShotInfo.json── VIEW  ▼
+                                          │            (player/club context)     GAME
+                                          │
+                                          ├── append → data/shots.jsonl
+                                          │
+                                          └── insert → Supabase `shots`
+                                                (with session_id + player_id when
+                                                 an Optix booking is active)
 ```
 
-The relay is **not in the GS Pro data path**. Uneekor → GSPconnect → GS Pro flows untouched; we just observe what VIEW writes to disk. That means there is nothing the relay can do — short of filling the disk — that affects the player's game.
+The relay is **not in the GS Pro data path**. We tail a log file; the game flow on `:9050` is untouched. There is nothing the relay can do — short of filling the disk — that affects the player's game.
 
-### Why file-watch instead of TCP
+### Why tail ConnectDebug.txt instead of watching VIEW's ShotData JSON
 
-The original design proposed MITM'ing the TCP link Uneekor → GS Pro on port 921 (per the GS Pro Connect V1 docs). Live inspection on the Bay 1 PC showed a different architecture: Uneekor's hardware speaks Uneekor-native, and a separate **GSPconnect** ("Uneekor Connect") bridge translates that to GS Pro's SimplePort on `:9050`. There is no `:921` listener at this install regardless of toggles. Watching VIEW's per-shot JSON is upstream of any of that and decoupled from any wire protocol change.
+Earlier iterations of this relay watched `ShotData/<n>/shotinfo.json` and ran a 50-line ballistic model to estimate carry from launch conditions. That was wrong on two counts: (1) VIEW's per-shot JSON is the **pre-translation** sensor output — velocities in m/s, no carry — because it lives upstream of GSPconnect; (2) GSPconnect's `ConnectDebug.txt` already mirrors the **post-translation** Open Connect envelope on every shot, with `Speed` in mph, `CarryDistance` in yards, plus the full BallData + ClubData split. Reading the log gets us GS Pro's own numbers verbatim. The ballistic model is gone.
+
+`ProShotInfo.json` is still watched as a tiny side-channel: it carries the player name, club ID, club name, and handedness — none of which appear in the Open Connect envelope. The side-watcher maintains an in-memory cache, refreshed on each new file write, that the log-tail pipeline reads when a shot fires.
 
 ---
 
@@ -175,13 +182,16 @@ curl "https://YOUR-PROJECT.supabase.co/rest/v1/shots?select=*&order=recorded_at.
 ```jsonc
 {
   "bay": {
-    "number": 1,                          // 1 or 2 — which bay this PC is
-    "optixResourceId": "609902"           // 609902 (Bay 1) or 619992 (Bay 2)
+    "number": 2,                          // 1 or 2 — which bay this PC is
+    "optixResourceId": "619992"           // 609902 (Bay 1) or 619992 (Bay 2)
+  },
+  "connect": {
+    "logPath":       "C:\\GSProV1\\Core\\GSPC\\ConnectDebug.txt",
+    "fromBeginning": false                // tail starts at EOF; set true only to backfill an existing log
   },
   "watch": {
-    "shotDataDir":      "C:\\Users\\suppo\\AppData\\LocalLow\\Uneekor\\VIEW\\ShotData",
-    "writeStabilityMs": 500,              // wait this long after last write before firing
-    "pollIntervalMs":   100               // chokidar internal polling
+    "shotDataDir":         "C:\\Users\\suppo\\AppData\\LocalLow\\Uneekor\\VIEW\\ShotData",
+    "proShotInfoStaleMs":  30000          // cache expires after this many ms of no new ProShotInfo writes
   },
   "supabase": {
     "url":         "",                    // empty → Supabase disabled, JSONL only
