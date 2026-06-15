@@ -3,13 +3,10 @@
     "number": 1,
     "optixResourceId": "609902"
   },
-  "relay": {
-    "listenHost": "0.0.0.0",
-    "listenPort": 921
-  },
-  "gspro": {
-    "host": "127.0.0.1",
-    "port": 922
+  "watch": {
+    "shotDataDir": "C:\\Users\\suppo\\AppData\\LocalLow\\Uneekor\\VIEW\\ShotData",
+    "writeStabilityMs": 500,
+    "pollIntervalMs": 100
   },
   "supabase": {
     "url": "",

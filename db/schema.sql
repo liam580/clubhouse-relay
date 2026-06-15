@@ -68,6 +68,13 @@ create table if not exists public.shots (
   recorded_at      timestamptz not null default now()
 );
 
+-- VIEW-source columns added by the file-watch pivot. The original schema was
+-- written against the GS Pro Connect V1 TCP payload (which Uneekor doesn't
+-- actually emit at this install); these capture the extra context VIEW writes.
+alter table public.shots add column if not exists club_id   integer;
+alter table public.shots add column if not exists hand      smallint;
+alter table public.shots add column if not exists assurance jsonb;
+
 create index if not exists idx_shots_player_id      on public.shots(player_id);
 create index if not exists idx_shots_session_id     on public.shots(session_id);
 create index if not exists idx_shots_recorded_at    on public.shots(recorded_at);

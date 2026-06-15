@@ -1,83 +1,101 @@
-# Clubhouse GS Pro Relay
+# Clubhouse VIEW Shot Relay
 
-A transparent Node.js TCP proxy that sits between the Uneekor launch monitor and GS Pro. Every shot is forwarded byte-for-byte to GS Pro (so the game continues normally) while a copy of each shot's JSON is appended to a local JSONL file **and** inserted into Supabase for the player profile.
+A Node.js service that watches Uneekor VIEW's per-shot JSON output, parses each shot, computes carry from a ballistic model, and saves it to Supabase tagged with the active Optix booking's player and session.
 
-**Status:** M1 (TCP relay + JSONL) ✓, M2 (Supabase) ✓, M3 (Optix session tagging) ✓.
-- Shots write to `data/shots.jsonl` always (durable local backup) and to Supabase when configured.
-- The relay polls Optix every 30s for the active booking on this bay's resource. When a booking is in progress, it upserts a `players` row, opens a `sessions` row, tags every incoming shot with `session_id` + `player_id`, and backfills the previous 60s of NULL-tagged shots. Sessions close when the booking ends (poll returns nothing) or after 10 min of no shots (safety net).
-- A 30-second polling latency at session start is covered by the 60-second backfill window — early warm-up shots get retroactively attributed.
+**Status:** M1 (file-watch + parser + ballistic) ✓, M2 (Supabase) ✓, M3 (Optix session tagging) ✓.
+- Each shot fires a row to `data/shots.jsonl` (durable local backup) and to Supabase when configured.
+- The relay polls Optix every 30 s for the active booking on this bay's resource. When a booking is in progress it upserts a `players` row, opens a `sessions` row, tags every shot in real time with `session_id` + `player_id`, and backfills the previous 60 s of NULL-tagged shots. Sessions close when the booking ends (poll returns nothing) or after 10 min of no shots (safety net).
+- The 30-second poll lag at session start is covered by the 60-second backfill — warm-up shots get retroactively attributed.
 
 ---
 
 ## How it fits
 
 ```
-Uneekor ──TCP──▶ Relay (this app) ──TCP──▶ GS Pro
-                       │
-                       └── append → data/shots.jsonl
+Uneekor VIEW ──writes──▶  ShotData/<n>/{shotinfo.json,
+                                          ProShotInfo.json,
+                                          imageinfo.xml, *.jpg}
+                              │
+                              │  ProShotInfo.json closes last (~9 s after the JPG burst)
+                              ▼
+                          Relay (this app)
+                              │
+                              ├── append → data/shots.jsonl
+                              │
+                              └── insert → Supabase `shots`
+                                    (with session_id + player_id when a booking is active)
 ```
 
-GS Pro is normally a TCP server on `127.0.0.1:921`. Two ways to wedge the relay in:
+The relay is **not in the GS Pro data path**. Uneekor → GSPconnect → GS Pro flows untouched; we just observe what VIEW writes to disk. That means there is nothing the relay can do — short of filling the disk — that affects the player's game.
 
-- **Option B (preferred):** point Uneekor at the relay on a custom port (e.g. 922), keep GS Pro on 921. Less risk to GS Pro.
-- **Option A (fallback):** relay listens on 921, GS Pro is moved to a different port (e.g. 922).
+### Why file-watch instead of TCP
 
-Both options use identical relay code. Only `relay.listenPort` and `gspro.port` in `config.json` change.
+The original design proposed MITM'ing the TCP link Uneekor → GS Pro on port 921 (per the GS Pro Connect V1 docs). Live inspection on the Bay 1 PC showed a different architecture: Uneekor's hardware speaks Uneekor-native, and a separate **GSPconnect** ("Uneekor Connect") bridge translates that to GS Pro's SimplePort on `:9050`. There is no `:921` listener at this install regardless of toggles. Watching VIEW's per-shot JSON is upstream of any of that and decoupled from any wire protocol change.
 
 ---
 
 ## One-time Supabase setup
 
-Before installing on the simulator PCs, set up the database (do this once for the whole project):
-
-1. Create a Supabase project at https://supabase.com (free tier is fine).
-2. In the Supabase dashboard, open **SQL Editor → New query**, paste the contents of [`db/schema.sql`](db/schema.sql), and run it. This creates the `players`, `sessions`, and `shots` tables with their indexes (including the unique partial index that prevents duplicate open sessions per bay) and enables RLS. Re-run any time the schema changes — every statement is `IF NOT EXISTS`.
+1. Create a Supabase project at https://supabase.com (free tier).
+2. Open **SQL Editor → New query**, paste [`db/schema.sql`](db/schema.sql), run it. Idempotent — re-run any time the schema changes.
 3. From **Project Settings → API**, copy:
-   - **Project URL** (looks like `https://xxxxx.supabase.co`)
-   - **`service_role` secret key** (under "Project API keys" — *not* the `anon` key)
+   - **Project URL** (`https://xxxxx.supabase.co`)
+   - **`service_role` secret key** (NOT the `anon` key — only `service_role` bypasses RLS)
 
-   ⚠️ The `service_role` key bypasses Row Level Security and grants full DB access. It must only live in `config.json` on the simulator PCs (already gitignored) — never commit it, never paste it in a frontend canvas.
-4. Both values get pasted into each simulator PC's `config.json` under `supabase.url` and `supabase.serviceKey` in the next section.
+   ⚠️ The `service_role` key grants full DB access. It belongs only in `config.json` on the Bay PCs (gitignored) — never commit it, never paste it in a frontend canvas.
 
-The relay tests Supabase reachability on startup and logs the result, but **does not block startup if it fails** — shots always land in `data/shots.jsonl` regardless. You can launch the relay before Supabase is configured and fill in the keys later.
+4. Both values go into each Bay PC's `config.json` under `supabase.url` and `supabase.serviceKey` below.
+
+The relay tests Supabase reachability on startup and logs the result, but does NOT block startup if it fails — shots always land in `data/shots.jsonl` regardless.
 
 ---
 
 ## One-time Optix setup
 
-The relay polls Optix's GraphQL API every 30s to detect bookings on each bay. To authenticate it needs an **organization token** (server-side, suffix `o`).
+The relay polls Optix's GraphQL API every 30 s. Needs an **organization token** (server-side, suffix `o`).
 
-1. Sign in to the Optix admin dashboard for the Clubhouse workspace.
-2. Navigate to **Develop → your app** (the custom app for Clubhouse — `client_id` from previous integrations).
-3. Copy the **organization token** (ends with `o`). Treat it like any other API secret — full server-side access to the Optix workspace.
-4. Confirm both bay resource IDs are accurate:
-   - Bay 1: `609902` (verified against live API — has booking history)
-   - Bay 2: `619992` (verified — schema-valid; cross-check with venue admin if it should be live)
-5. The token + GraphQL URL go into each simulator PC's `config.json` under `optix.orgToken` and `optix.graphqlUrl`.
+1. Optix admin → **Develop → your app** → copy the organization token.
+2. Confirm bay resource IDs are accurate:
+   - Bay 1: `609902`
+   - Bay 2: `619992`
+3. Token + GraphQL URL go into each Bay PC's `config.json` under `optix.orgToken` and `optix.graphqlUrl`.
 
-If `optix.orgToken` is left empty, the session manager is disabled and shots are saved with `session_id: null` and `player_id: null` — the relay still works, just without session tagging.
+Leave `optix.orgToken` empty to disable session polling — shots still save, just untagged.
+
+### Verifying Optix end-to-end
+
+[`scripts/verify-optix.js`](scripts/verify-optix.js) introspects the live `Query.bookings` field and runs the relay's actual current-booking query against a real resource. From the deploy directory:
+
+```powershell
+$env:OPTIX_TOKEN = "<the org token>"
+node scripts/verify-optix.js 609902
+```
+
+Expected: HTTP 200, raw GraphQL data prints, `RESULT: query executed cleanly`, exit 0. See the script's docblock for failure-mode triage.
 
 ---
 
-## One-time install (per simulator PC, Windows)
+## One-time install (per Bay PC, Windows)
 
-1. Install Node.js LTS from https://nodejs.org (any 18+ release works).
+1. Install Node.js LTS from https://nodejs.org (18+).
 
-2. Install pm2 globally and register it as a Windows service so the relay survives reboots:
+2. Install pm2 globally and register it as a Windows service:
 
    ```powershell
    npm install -g pm2 pm2-windows-startup
    pm2-startup install
    ```
 
-3. Clone or copy this `relay/` directory onto the simulator PC, then install dependencies:
+3. Clone this repo and install dependencies:
 
    ```powershell
-   cd relay
+   cd $env:USERPROFILE
+   git clone https://github.com/liam580/clubhouse-relay.git
+   cd clubhouse-relay
    npm install
    ```
 
-4. Copy `config.example.json` to `config.json` and edit it for this PC:
+4. Copy `config.example.json` → `config.json` and edit:
 
    ```powershell
    copy config.example.json config.json
@@ -85,22 +103,22 @@ If `optix.orgToken` is left empty, the session manager is disabled and shots are
    ```
 
    Set:
-   - `bay.number` → `1` for Bay 1, `2` for Bay 2
+   - `bay.number` → `1` or `2`
    - `bay.optixResourceId` → `609902` (Bay 1) or `619992` (Bay 2)
-   - `relay.listenPort` and `gspro.port` → based on whichever option (A or B) the Uneekor UI supports
-   - `supabase.url` and `supabase.serviceKey` → from the Supabase setup section above (leave empty to disable Supabase writes; shots will still land in `data/shots.jsonl`)
-   - `optix.orgToken` → from the Optix setup section above (leave empty to disable session polling)
+   - `watch.shotDataDir` → confirm the path matches your user (default assumes `suppo`; check `C:\Users\<u>\AppData\LocalLow\Uneekor\VIEW\ShotData`)
+   - `supabase.url` / `supabase.serviceKey` → from the Supabase setup
+   - `optix.orgToken` → from the Optix setup
 
-5. Start the relay under pm2 and persist it across reboots:
+5. Start under pm2:
 
    ```powershell
    pm2 start ecosystem.config.js
    pm2 save
    ```
 
-6. Verify by rebooting the PC and running `pm2 list`. The relay should be back up automatically.
+6. Reboot the PC and run `pm2 list` to confirm the service auto-restarts.
 
-7. **Configure Uneekor** to point at the relay's listen port (or, in Option A, point Uneekor at 921 and reconfigure GS Pro to listen on 922 instead). Confirm in the Uneekor software UI.
+No GS Pro / Uneekor configuration is needed. The relay never touches their network paths.
 
 ---
 
@@ -108,38 +126,39 @@ If `optix.orgToken` is left empty, the session manager is disabled and shots are
 
 ```powershell
 pm2 list                        # what's running
-pm2 logs clubhouse-relay        # live operational log (follow)
+pm2 logs clubhouse-relay        # live log
 pm2 logs clubhouse-relay --lines 200
 pm2 restart clubhouse-relay
 pm2 stop clubhouse-relay
-pm2 start ecosystem.config.js   # if previously stopped
+pm2 start ecosystem.config.js
 ```
 
-Shot records: `data\shots.jsonl` — one JSON object per line, mirroring the row shape sent to Supabase.
+Shot records: `data\shots.jsonl` — one JSON object per line.
 
 ```jsonc
 {
   "session_id": null,
   "player_id": null,
   "bay_number": 1,
-  "shot_number": 13,
-  "ball_speed": 147.5,
-  "spin_axis": -13.2,
-  "total_spin": 3250,
-  "hla": 2.3,
-  "vla": 14.3,
-  "carry_distance": 256.5,
-  "club_speed": 0,
-  "attack_angle": 0,
-  "face_to_target": 0,
-  "path": 0,
-  "club": null,
-  "raw": { /* full Uneekor payload for debugging */ },
-  "recorded_at": "2026-05-07T19:23:11.482Z"
+  "shot_number": 993,
+  "ball_speed": 45.08,
+  "spin_axis": 1.3715,
+  "total_spin": 8340.3125,
+  "hla": 0.306,
+  "vla": 19.7957,
+  "carry_distance": 29.9,
+  "club_speed": 35.1305,
+  "face_to_target": 0.4227,
+  "attack_angle": -7.5356,
+  "path": -0.7444,
+  "club": "IRON7",
+  "club_id": 24,
+  "hand": 0,
+  "assurance": { "clubSpeed": 89, "clubPath": 85, "faceAngle": 75, "attackAngle": 1 },
+  "raw": { "shotinfo": { /* … */ }, "proShotInfo": { /* … */ } },
+  "recorded_at": "2026-06-10T08:48:59.482Z"
 }
 ```
-
-Operational log mirror: `data\relay.log`.
 
 Verify a Supabase insert landed:
 
@@ -159,75 +178,69 @@ curl "https://YOUR-PROJECT.supabase.co/rest/v1/shots?select=*&order=recorded_at.
     "number": 1,                          // 1 or 2 — which bay this PC is
     "optixResourceId": "609902"           // 609902 (Bay 1) or 619992 (Bay 2)
   },
-  "relay": {
-    "listenHost": "0.0.0.0",
-    "listenPort": 921                     // port Uneekor sends to (921 for Option A, 922 for Option B)
-  },
-  "gspro": {
-    "host": "127.0.0.1",
-    "port": 922                           // port GS Pro is listening on (922 for Option A, 921 for Option B)
+  "watch": {
+    "shotDataDir":      "C:\\Users\\suppo\\AppData\\LocalLow\\Uneekor\\VIEW\\ShotData",
+    "writeStabilityMs": 500,              // wait this long after last write before firing
+    "pollIntervalMs":   100               // chokidar internal polling
   },
   "supabase": {
-    "url": "",                            // empty → Supabase disabled, shots go to JSONL only
-    "serviceKey": "",                     // service_role key from Supabase project settings
-    "shotsTable": "shots"
+    "url":         "",                    // empty → Supabase disabled, JSONL only
+    "serviceKey":  "",                    // service_role key
+    "shotsTable":  "shots"
   },
   "optix": {
     "graphqlUrl":     "https://api.optixapp.com/graphql",
-    "orgToken":       "",                 // organization token (suffix 'o') — empty disables session polling
-    "pollIntervalMs": 30000,              // how often to ask Optix "any active booking on this bay?"
-    "fetchTimeoutMs": 5000                // per-request timeout
+    "orgToken":       "",                 // empty → session polling disabled
+    "pollIntervalMs": 30000,
+    "fetchTimeoutMs": 5000
   },
   "session": {
-    "inactivityTimeoutMs": 600000,        // safety net: close session if no shots for 10 min
+    "inactivityTimeoutMs": 600000,        // safety net: close after 10 min of no shots
     "backfillWindowMs":    60000          // on session open, retroactively tag NULL shots from this window
   },
   "logging": {
     "level": "info",
-    "file": "./data/relay.log"
+    "file":  "./data/relay.log"
   }
 }
 ```
 
-**Important:** `config.json` is gitignored. Each simulator PC has its own copy with bay-specific values. `config.example.json` is the committed template.
+`config.json` is gitignored. Each Bay PC has its own. `config.example.json` is the committed template.
 
 ---
 
 ## Local development & smoke test
-
-From the `relay/` directory:
 
 ```sh
 npm install
 npm run smoke
 ```
 
-The smoke harness spins up fake GS Pro, Supabase, and Optix servers, starts the relay against a temp config, and drives every code path through 15 scenarios:
+The harness exercises every code path:
 
-**M1 — TCP relay**
-1. Single shot in one TCP write
-2. Single shot split across two TCP writes (defensive parser)
-3. Two shots back-to-back, newline-delimited
-4. Two shots back-to-back, no separator
-5. Fail-open: relay survives an unreachable GS Pro
+**M1 — parser + watcher + ballistic**
+1. Single shot dir lands → parsed → padded-string numerics float-cast, ClubName / Club / player Name carried, assurance values converted
+2. Two shots back-to-back, both ingested in numeric order, last-shot advances to highest
+3. ProShotInfo.json present but shotinfo.json missing → rejected gracefully, last-shot NOT advanced so retry can succeed
+4. Reference shot (`Star: true`) — VIEW's bundled pro demos — suppressed; last-shot advances past them anyway
+5. Restart resume from `data/last-shot.json` — `n ≤ last-seen` skipped, new shots ingested
+6. Live chokidar test — start the watcher, write a shot dir, confirm `awaitWriteFinish` delivers the parsed shot
+7. Ballistic carry computation produces tour-driver-realistic numbers and returns `null` on bad inputs
 
 **M2 — Supabase**
-6. Shot POSTed with apikey + Bearer headers; flattened columns match BallData/ClubData
-7. Supabase down does not block startup; relay listens immediately and JSONL still writes
+8. Shot POSTed to `/rest/v1/shots` with `apikey` + `Bearer` headers; VIEW fields mapped to the existing schema columns (`ballspeed`→`ball_speed`, `incline`→`vla`, `azimuth`→`hla`, `ClubName`→`club`, etc.); `carry_distance` computed Mac-side; `assurance` JSONB and both source JSONs preserved in `raw`
+9. Supabase down does not block startup; shots still land in JSONL
 
 **M3 — Optix session manager**
-8. Session opens when poll finds an active booking; player upserted with optix ids + email + name; session row inserted
-9. Session stays open across multiple polls of the same booking (no duplicate row)
-10. Session closes when poll returns no booking; `ended_at` and `shot_count` are finalized
-11. Backfill rewrites pre-session NULL shots within the 60s window; older NULL shots are left untouched
-12. Inactivity timeout closes the session as a safety net even if the booking is still upstream
-13. Optix HTTP 500 and GraphQL errors are logged but do not change session state or crash the process
-14. Relay restart with an active booking resumes the existing open session row instead of creating a duplicate
-15. Shots arriving during an open session are tagged in real time with `session_id` + `player_id`
+10. Session opens when poll finds an active booking; player upserted with Optix IDs + email + name; session row inserted
+11. Session stays open across multiple polls of the same booking (no duplicate row)
+12. Session closes when poll returns no booking; `ended_at` + `shot_count` finalized
+13. Backfill rewrites pre-session NULL shots within the 60 s window; older NULL shots left untouched
+14. Inactivity timeout closes the session as a safety net
+15. Optix HTTP 500 and GraphQL errors are logged but do not change session state or crash; recovery transitions correctly
+16. Restart with an active booking re-attaches to the existing open session row instead of creating a duplicate
 
-All shot records land in a temp `shots.jsonl` and the GS Pro side receives the original bytes intact.
-
-To run the relay against a real GS Pro locally for manual testing:
+Run the relay against a real VIEW install locally:
 
 ```sh
 RELAY_CONFIG=./config.json node src/index.js
@@ -235,45 +248,29 @@ RELAY_CONFIG=./config.json node src/index.js
 
 ---
 
-## On-site verification checklist (when at the simulator)
+## On-site verification checklist
 
-1. Open the Uneekor software. Find the GS Pro target IP/port setting. Record whether the **port** field is editable.
-   - Editable → use **Option B**: set Uneekor to `127.0.0.1:922`, leave GS Pro on `921`. In `config.json`: `relay.listenPort = 922`, `gspro.port = 921`.
-   - Not editable → use **Option A**: reconfigure GS Pro to listen on `922`, leave Uneekor pointing at `921`. In `config.json`: `relay.listenPort = 921`, `gspro.port = 922`.
-2. Save `config.json` and `pm2 restart clubhouse-relay`.
-3. Hit a ball.
-4. Confirm:
-   - GS Pro registers the shot and the game continues.
-   - `Get-Content data\shots.jsonl -Wait -Tail 5` (PowerShell tail-follow) shows the new shot record within ~1 second.
-   - `pm2 logs clubhouse-relay --lines 50` shows clean operational output, no errors.
-5. **Capture a sample.** Save the first real Uneekor TCP write to a file (e.g. add a temporary `console.log(chunk.toString('utf8'))` in `relay.js`, or copy a line from `shots.jsonl`'s `raw` field). Drop it into the test suite as a regression fixture.
-6. Reboot the PC. Confirm `pm2 list` shows the relay running again.
+1. After install, take a single real shot.
+2. Confirm:
+   - A new numbered subdirectory appeared under `watch.shotDataDir` containing `shotinfo.json`, `ProShotInfo.json`, and JPG frames.
+   - Within a couple of seconds of the ProShotInfo.json file appearing, `Get-Content data\shots.jsonl -Wait -Tail 5` shows the new shot record.
+   - `pm2 logs clubhouse-relay --lines 50` shows `shot captured from VIEW` for the right `n`.
+   - `data\last-shot.json` updated to that `n`.
+3. Reboot the PC. Confirm `pm2 list` shows the relay running again.
+4. Hit one more shot. Confirm it lands.
 
 ---
 
 ## Architecture notes
 
-```
-Uneekor ──TCP──▶ Relay ──TCP──▶ GS Pro
-                   │
-                   ├── append → data/shots.jsonl
-                   │
-                   ├── insert → Supabase shots (with session_id + player_id from session manager)
-                   │
-                   └── session manager
-                          │
-                          ├── poll Optix every 30s for active booking
-                          ├── upsert players, insert/close sessions, backfill NULL shots
-                          └── hand {session_id, player_id} tag to persistence
-```
-
-- **Fail-open invariant:** any failure in the parser, persistence, Supabase, or Optix path must NOT block the forward TCP path. Game flow is sacred. The relay's two pipes (Uneekor→GSPro, GSPro→Uneekor) only depend on raw socket bytes; everything else runs in `try` blocks with logged errors.
-- **JSON framing** (`src/parser.js`) is brace-balanced with string-literal awareness. Tolerates newline-delimited, single-write, and split-across-writes deliveries.
-- **Persistence** (`src/persistence.js`) writes every shot to a JSONL append-stream and (when configured) POSTs the same row to Supabase's PostgREST endpoint at `/rest/v1/shots`. Each shot consults `sessionManager.getCurrentTag()` to populate `session_id` + `player_id`.
-- **Session manager** (`src/session-manager.js`) is a small state machine — `NO_SESSION ⇄ SESSION_OPEN` — driven by a 30s polling timer that calls `Query.bookings(resource_id, in_progress: true)`. On open: upsert player, insert session, backfill NULL shots from the last 60s. On close (poll returns no booking, or 10-min inactivity safety net): finalize `ended_at` + `shot_count` (counted via PostgREST `Prefer: count=exact`).
-- **Resume on restart:** before inserting a new session row, the manager queries `sessions WHERE bay_number = N AND optix_booking_id = X AND ended_at IS NULL`. If a row exists (relay restarted mid-booking), it attaches to that row instead of creating a duplicate.
-- **JSONL is point-in-time append.** Backfill only updates Supabase; the local JSONL keeps its original NULL values for shots that arrived before their session opened. Supabase is the canonical store; JSONL is the local debug log.
-- **Optix `bookings(resource_id: ...)` takes `[ID]` not `ID`.** The query uses a `[ID]` variable type with a one-element array — the schema rejected `ID!` in live testing. Documented in `optix-client.js`.
+- **Fail-open is automatic.** The relay is not in the data path — Uneekor → GSPconnect → GS Pro flows untouched. There's no game-flow risk by design, unlike the original TCP MITM proposal.
+- **VIEW writes two JSONs per shot.** `shotinfo.json` lands with the JPG burst (~9 s before ProShotInfo). `ProShotInfo.json` writes last and is the trigger — chokidar's `awaitWriteFinish` keeps us from racing the writer.
+- **Numeric fields are space-padded strings.** Every VIEW field comes through as e.g. `"   45.0800"`. `src/view-parser.js`'s `num()` helper strips + float-casts; empty strings become `null`.
+- **Reference shots are filtered.** VIEW ships with bundled "pro reference" swings under `Star: true`. They sit in the same `ShotData` namespace and would otherwise contaminate the player's stats. The parser drops them but the watcher still advances `last-shot.json` so we don't re-evaluate them on every event.
+- **Lifetime counter, not session counter.** `<n>` is monotonic across reboots and players — currently in the high hundreds at Bay 1. `data/last-shot.json` persists the highest ingested `n` so a relay restart doesn't double-process anything on disk.
+- **Carry distance is computed locally** (`src/ballistic.js`) because Uneekor only measures launch + spin — they leave carry to be computed by the game engine. A 2D ballistic integrator with drag + Magnus lift, calibrated to land within ~5–10% of GS Pro on full shots.
+- **Persistence layer is column-stable.** The Supabase shot row uses the original column names (`hla`, `vla`, `attack_angle`, `path`, `face_to_target`) — same physical quantities, different VIEW field names. New columns: `club_id` (numeric Uneekor club code), `hand` (0/1), `assurance` (JSONB with per-measurement confidence).
+- **Resume on restart.** Before inserting a new session row the manager queries `sessions WHERE bay_number = N AND optix_booking_id = X AND ended_at IS NULL`. If a row exists (relay restarted mid-booking), it attaches instead of creating a duplicate.
 
 ---
 
@@ -281,16 +278,14 @@ Uneekor ──TCP──▶ Relay ──TCP──▶ GS Pro
 
 | Symptom | Likely cause |
 |---|---|
-| `EADDRINUSE` on relay start | Another process is on `relay.listenPort` (often GS Pro itself if Option A and you forgot to move GS Pro to a different port) |
-| Uneekor can connect but no shots reach GS Pro | `gspro.port` in `config.json` doesn't match where GS Pro is actually listening. Check GS Pro settings. |
-| `ECONNREFUSED` to GS Pro in logs | GS Pro isn't running. Start GS Pro first, then `pm2 restart clubhouse-relay`. |
-| `shots.jsonl` has 0 lines after a real shot | Parser didn't recognize Uneekor's framing. Capture the raw bytes (see step 5 above) and add to the test suite — the framer needs to learn that variant. |
-| Game continues but pm2 keeps restarting the relay | Check `data/pm2-err.log` for stack traces. |
-| Logs say `supabase health check FAILED` | Confirm the URL and service key in `config.json`, and that `db/schema.sql` has been run. The relay will keep running and writing to JSONL regardless. |
+| `data\shots.jsonl` empty after a real shot | Check `watch.shotDataDir` matches your actual Windows user. Default is `C:\Users\suppo\...`. Adjust in `config.json`. |
+| Relay logs `failed to read shot dir — will retry on next event` | `shotinfo.json` or `ProShotInfo.json` was missing or malformed when the trigger fired. Usually transient — VIEW may have crashed mid-write. The next shot recovers. |
+| `data\last-shot.json` not advancing | Either no shots are landing (check VIEW is configured to write to the watched dir), or every shot is `Star: true` (a reference, not a real swing). |
+| Logs say `supabase health check FAILED` | Confirm `url` + `serviceKey` in `config.json`, and that `db/schema.sql` has been run. Relay will keep writing JSONL regardless. |
 | Supabase insert errors with `42P01` (relation does not exist) | Run `db/schema.sql` in the Supabase SQL editor. |
-| Supabase insert errors with `42501` (permission denied) | You're using the `anon` key. Use the `service_role` key instead. |
-| `optix poll failed: HTTP 401` in pm2 logs | Org token rotated or wrong. Refresh from **Optix admin → Develop → your app**. |
-| `session manager disabled` log on startup | `optix.orgToken` is empty in `config.json`. Sessions won't open; shots save with NULL tags. Fill in the token and restart. |
-| Booking is active in Optix but session never opens | Confirm `bay.optixResourceId` matches the actual resource (`609902` for Bay 1, `619992` for Bay 2). Check pm2 logs for `optix poll failed`. |
-| Duplicate session rows for one bay | Should be impossible — the unique partial index `uniq_sessions_open_per_bay` prevents two open sessions on the same bay. If you see this, run `db/schema.sql` to add the index. |
-| Session closes mid-game | Either the booking ended in Optix, or the 10-min inactivity safety net fired. Check `data/relay.log` for `inactivity timeout` or `booking_ended`. |
+| Supabase insert errors with `42501` (permission denied) | You're using the `anon` key. Use the `service_role` key. |
+| `optix poll failed: HTTP 401` in pm2 logs | Org token rotated or wrong. Refresh from Optix admin → Develop → your app. |
+| `session manager disabled` log on startup | `optix.orgToken` is empty. Sessions won't open; shots save with NULL tags. Fill in the token and restart. |
+| Booking active in Optix but session never opens | Confirm `bay.optixResourceId` matches the actual resource (`609902` Bay 1, `619992` Bay 2). Check pm2 logs for `optix poll failed`. |
+| Carry distance values look wrong | The ballistic model is calibrated for full shots; chunky / chipped swings will be approximate. The raw VIEW measurements (`ball_speed`, `vla`, `backspin`, etc.) are still recorded — re-derive offline if needed. |
+| Duplicate session rows for one bay | Should be impossible — the unique partial index `uniq_sessions_open_per_bay` prevents two open sessions on the same bay. If you see this, re-run `db/schema.sql`. |

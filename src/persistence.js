@@ -3,36 +3,54 @@
 const fs = require('fs');
 const path = require('path');
 const { createSupabaseClient } = require('./supabase');
+const { computeCarryYards } = require('./ballistic');
 
 const SHOTS_FILE = 'shots.jsonl';
 
-function flattenShot(rawShot) {
-  const ball = (rawShot && rawShot.BallData) || {};
-  const club = (rawShot && rawShot.ClubData) || {};
+// Maps the unified VIEW shot record (produced by src/view-parser.js) onto the
+// Supabase `shots` columns. Naming convention is whatever was already there
+// from the original GS Pro Connect schema — hla/vla/attack_angle/path/etc —
+// even though the VIEW field names are different. Same physical quantities.
+function flattenShot(shot) {
   const pick = (v) => (v === undefined ? null : v);
+  if (!shot) return {};
+
+  let carry = null;
+  if (shot.ballSpeed != null && shot.vla != null && shot.backspin != null) {
+    const c = computeCarryYards({
+      ballSpeedMph: shot.ballSpeed,
+      vlaDeg: shot.vla,
+      backspinRpm: shot.backspin
+    });
+    if (c != null) carry = Math.round(c * 10) / 10;
+  }
+
   return {
-    shot_number:    pick(rawShot && rawShot.ShotNumber),
-    ball_speed:     pick(ball.Speed),
-    spin_axis:      pick(ball.SpinAxis),
-    total_spin:     pick(ball.TotalSpin),
-    hla:            pick(ball.HLA),
-    vla:            pick(ball.VLA),
-    carry_distance: pick(ball.CarryDistance),
-    club_speed:     pick(club.Speed),
-    attack_angle:   pick(club.AngleOfAttack),
-    face_to_target: pick(club.FaceToTarget),
-    path:           pick(club.Path),
-    club:           pick(rawShot && rawShot.Club)
+    shot_number:    pick(shot.shotNumber),
+    ball_speed:     pick(shot.ballSpeed),
+    spin_axis:      pick(shot.spinAxis),
+    total_spin:     pick(shot.totalSpin),
+    hla:            pick(shot.hla),
+    vla:            pick(shot.vla),
+    carry_distance: carry,
+    club_speed:     pick(shot.clubSpeed),
+    face_to_target: pick(shot.faceAngle),
+    attack_angle:   pick(shot.attackAngle),
+    path:           pick(shot.clubPath),
+    club:           pick(shot.clubName),    // existing text column repurposed
+    club_id:        pick(shot.clubId),
+    hand:           pick(shot.hand),
+    assurance:      pick(shot.assurance)
   };
 }
 
-function buildShotRow({ rawShot, bayNumber, tag }) {
+function buildShotRow({ shot, bayNumber, tag }) {
   return {
     session_id: tag?.session_id || null,
-    player_id: tag?.player_id || null,
+    player_id:  tag?.player_id  || null,
     bay_number: bayNumber,
-    ...flattenShot(rawShot),
-    raw: rawShot,
+    ...flattenShot(shot),
+    raw: (shot && shot.raw) ? shot.raw : shot,
     recorded_at: new Date().toISOString()
   };
 }
@@ -50,14 +68,14 @@ function createPersistence({ config, logger, dataDir, supabase, getTag }) {
   const supa = supabase || createSupabaseClient({ config, logger });
   const tagFn = typeof getTag === 'function' ? getTag : () => null;
 
-  function saveShot(rawShot) {
+  function saveShot(shot) {
     let tag = null;
     try {
       tag = tagFn() || null;
     } catch (err) {
       logger.error({ err: err.message }, 'getTag callback threw — saving shot untagged');
     }
-    const row = buildShotRow({ rawShot, bayNumber: config.bay.number, tag });
+    const row = buildShotRow({ shot, bayNumber: config.bay.number, tag });
 
     let line;
     try {

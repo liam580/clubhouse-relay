@@ -7,7 +7,8 @@ const { createSupabaseClient } = require('./supabase');
 const { createOptixClient } = require('./optix-client');
 const { createSessionManager } = require('./session-manager');
 const { createPersistence } = require('./persistence');
-const { createRelay } = require('./relay');
+const { createFileWatcher } = require('./file-watcher');
+const { createLastShotTracker } = require('./last-shot');
 
 async function main() {
   const configPath = process.env.RELAY_CONFIG || path.resolve(__dirname, '..', 'config.json');
@@ -17,14 +18,16 @@ async function main() {
   logger.info(
     {
       bay: config.bay.number,
-      listen: `${config.relay.listenHost}:${config.relay.listenPort}`,
-      gspro: `${config.gspro.host}:${config.gspro.port}`,
+      watchRoot: config.watch.shotDataDir,
       supabase: config.supabase.serviceKey ? 'enabled' : 'disabled',
       optix: config.optix?.orgToken ? 'enabled' : 'disabled',
       configPath
     },
     'starting clubhouse-relay'
   );
+
+  const dataDir = path.resolve(__dirname, '..', 'data');
+  const lastShot = createLastShotTracker({ dataDir, logger });
 
   const supabase = createSupabaseClient({ config, logger });
   const optixClient = createOptixClient({ config, logger });
@@ -36,14 +39,26 @@ async function main() {
     supabase,
     getTag: () => sessionManager.getCurrentTag()
   });
-  const relay = createRelay({
+
+  const watcher = createFileWatcher({
     config,
     logger,
-    persistence,
-    onShot: () => sessionManager.noteShot()
+    lastShot,
+    onShot: (shot) => {
+      try {
+        persistence.saveShot(shot);
+      } catch (err) {
+        logger.error({ err: err.message }, 'persistence.saveShot threw');
+      }
+      try {
+        sessionManager.noteShot();
+      } catch (err) {
+        logger.error({ err: err.message }, 'sessionManager.noteShot threw');
+      }
+    }
   });
 
-  await relay.listen();
+  await watcher.start();
 
   // Non-blocking Supabase reachability check.
   supabase.healthCheck().then((result) => {
@@ -56,7 +71,7 @@ async function main() {
 
   // Start the Optix poll loop. start() runs an immediate poll and schedules
   // the recurring loop. We don't await it — a slow first poll must not delay
-  // accepting Uneekor connections.
+  // the watcher.
   sessionManager.start().catch((err) => {
     logger.error({ err: err.message }, 'session manager start failed');
   });
@@ -68,7 +83,7 @@ async function main() {
     logger.info({ signal }, 'shutting down');
     try {
       await sessionManager.stop();
-      await relay.close();
+      await watcher.stop();
       await persistence.close();
     } catch (err) {
       logger.error({ err: err.message }, 'error during shutdown');

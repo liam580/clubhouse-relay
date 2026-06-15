@@ -2,7 +2,7 @@
   "name": "clubhouse-relay",
   "version": "0.1.0",
   "private": true,
-  "description": "Clubhouse GS Pro shot data relay — Milestone 1",
+  "description": "Clubhouse VIEW shot data relay — file-watch input → Supabase + Optix sessions",
   "main": "src/index.js",
   "engines": {
     "node": ">=18"
@@ -16,6 +16,7 @@
     "pm2:logs": "pm2 logs clubhouse-relay"
   },
   "dependencies": {
+    "chokidar": "^4.0.3",
     "pino": "^9.5.0"
   }
 }

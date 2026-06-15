@@ -6,7 +6,7 @@ function loadConfig(configPath) {
   if (!fs.existsSync(resolved)) {
     throw new Error(
       `Config file not found: ${resolved}\n` +
-        `Copy config.example.json to config.json and fill in bay number + ports.`
+        `Copy config.example.json to config.json and fill in bay number + watch.shotDataDir.`
     );
   }
 
@@ -28,11 +28,22 @@ function validateConfig(c) {
   req(c.bay && Number.isInteger(c.bay.number), 'bay.number must be an integer');
   req(c.bay && typeof c.bay.optixResourceId === 'string', 'bay.optixResourceId must be a string');
 
-  req(c.relay && typeof c.relay.listenHost === 'string', 'relay.listenHost must be a string');
-  req(c.relay && Number.isInteger(c.relay.listenPort), 'relay.listenPort must be an integer');
-
-  req(c.gspro && typeof c.gspro.host === 'string', 'gspro.host must be a string');
-  req(c.gspro && Number.isInteger(c.gspro.port), 'gspro.port must be an integer');
+  req(
+    c.watch && typeof c.watch.shotDataDir === 'string' && c.watch.shotDataDir.length > 0,
+    'watch.shotDataDir must be a non-empty string (path to VIEW ShotData directory)'
+  );
+  if (c.watch && c.watch.writeStabilityMs !== undefined) {
+    req(
+      Number.isInteger(c.watch.writeStabilityMs) && c.watch.writeStabilityMs >= 0,
+      'watch.writeStabilityMs must be a non-negative integer'
+    );
+  }
+  if (c.watch && c.watch.pollIntervalMs !== undefined) {
+    req(
+      Number.isInteger(c.watch.pollIntervalMs) && c.watch.pollIntervalMs >= 10,
+      'watch.pollIntervalMs must be an integer >= 10'
+    );
+  }
 
   req(c.supabase && typeof c.supabase.url === 'string', 'supabase.url must be a string (may be empty)');
   req(c.supabase && typeof c.supabase.serviceKey === 'string', 'supabase.serviceKey must be a string (may be empty)');
@@ -48,16 +59,6 @@ function validateConfig(c) {
     if (c.session.backfillWindowMs !== undefined) {
       req(Number.isInteger(c.session.backfillWindowMs) && c.session.backfillWindowMs >= 0, 'session.backfillWindowMs must be a non-negative integer');
     }
-  }
-
-  if (
-    c.relay && c.gspro &&
-    c.relay.listenPort === c.gspro.port &&
-    (c.gspro.host === '127.0.0.1' || c.gspro.host === 'localhost' || c.relay.listenHost === '127.0.0.1' || c.relay.listenHost === '0.0.0.0')
-  ) {
-    errors.push(
-      `relay.listenPort (${c.relay.listenPort}) and gspro.port (${c.gspro.port}) collide on the same host — the relay would loop into itself.`
-    );
   }
 
   if (errors.length) {
