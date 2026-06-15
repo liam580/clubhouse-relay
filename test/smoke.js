@@ -254,6 +254,49 @@ function reassemblerHeartbeatScenario() {
   console.log('  ✓ pending map never sees heartbeats');
 }
 
+async function reassemblerStatusPingScenario() {
+  console.log('\n— scenario: reassembler — status pings (no ball + no club) skipped, no phantom —');
+
+  // Real Connect quirk Bay 2 observed: status messages like
+  // LaunchMonitorBallDetected / LaunchMonitorIsReady arrive with
+  // IsHeartBeat: false but Contains*Data: false AND no Ball/Club
+  // subobjects. Without the early return, the sweeper would emit them
+  // as all-null phantom rows. Regression test for that.
+  const statusPing = {
+    DeviceID: "UNEEKOR EYEXR",
+    Units: "Yards",
+    ShotNumber: 99001,
+    APIversion: "2",
+    BallData: null,
+    ClubData: null,
+    ShotDataOptions: {
+      ContainsBallData: false,
+      ContainsClubData: false,
+      IsHeartBeat: false,
+      LaunchMonitorBallDetected: true,
+      LaunchMonitorIsReady: false,
+    },
+  };
+
+  const emitted = [];
+  const r = createReassembler({ timeoutMs: 30, sweepIntervalMs: 50, onShot: (m) => emitted.push(m) });
+  r.start();
+
+  r.feed(statusPing);
+  r.feed(statusPing);
+  r.feed({ ...statusPing, ShotNumber: 99002 });
+
+  assert.strictEqual(r._pending().size, 0, 'status pings never enter pending');
+
+  // Let the sweep elapse to confirm nothing leaks out as a partial.
+  await sleep(120);
+  assert.strictEqual(emitted.length, 0, 'no phantom rows from status pings');
+
+  r.stop();
+  console.log('  ✓ status pings (Contains*Data both false) skipped at feed-time');
+  console.log('  ✓ sweep never emits an all-null phantom');
+}
+
 async function reassemblerPartialTimeoutScenario() {
   console.log('\n— scenario: reassembler — ball-only times out and emits partial —');
 
@@ -906,6 +949,7 @@ async function shotTaggingScenario() {
     extractEnvelopeScenario();
     reassemblerHappyPathScenario();
     reassemblerHeartbeatScenario();
+    await reassemblerStatusPingScenario();
     await reassemblerPartialTimeoutScenario();
     reassemblerIndependentShotsScenario();
     spinDerivationScenario();

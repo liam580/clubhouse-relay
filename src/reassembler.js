@@ -80,10 +80,16 @@ function createReassembler({
     // partial after the sweep timeout.
     if (emittedRecently.has(n)) return;
 
-    const entry = pending.get(n) || { ball: null, club: null, firstSeenAt: Date.now() };
-
     const containsBall = opts.ContainsBallData === true || env.BallData != null;
     const containsClub = opts.ContainsClubData === true || env.ClubData != null;
+
+    // Connect emits status pings (LaunchMonitorBallDetected, LaunchMonitorIsReady,
+    // etc.) with IsHeartBeat: false but neither Contains*Data flag set and no
+    // BallData/ClubData subobject. Don't enter pending for those — otherwise
+    // the sweep would later emit an all-null phantom row.
+    if (!containsBall && !containsClub) return;
+
+    const entry = pending.get(n) || { ball: null, club: null, firstSeenAt: Date.now() };
 
     if (containsBall && entry.ball == null) entry.ball = env;
     if (containsClub && entry.club == null) entry.club = env;
