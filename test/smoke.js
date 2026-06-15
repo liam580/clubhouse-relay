@@ -17,7 +17,7 @@ const { createOptixClient } = require('../src/optix-client');
 const { createSessionManager } = require('../src/session-manager');
 
 // ─── VIEW shot fixtures ─────────────────────────────────────────────────
-// SHOT A is verbatim from the Bay 1 PC capture (ShotData/993). Padded
+// SHOT A is verbatim from the Bay 2 PC capture (ShotData/993). Padded
 // numeric strings exactly as VIEW writes them.
 
 const SHOTINFO_A = {
