@@ -4,7 +4,8 @@
     "optixResourceId": "619992"
   },
   "connect": {
-    "logPath": "C:\\GSProV1\\Core\\GSPC\\ConnectDebug.txt",
+    "_comment": "logPath can point at VIEW's Player.log (current canonical source on bays where VIEW talks to GS Pro directly) OR at GSPconnect's ConnectDebug.txt (the original 2026-06-15 routing). See docs/session-findings-2026-06-18.md.",
+    "logPath": "C:\\Users\\suppo\\AppData\\LocalLow\\Uneekor\\VIEW\\Player.log",
     "fromBeginning": false
   },
   "watch": {

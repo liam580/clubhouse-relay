@@ -20,7 +20,7 @@ async function main() {
   logger.info(
     {
       bay:        config.bay.number,
-      connectLog: config.connect.logPath,
+      shotLog:    config.connect.logPath,
       watchRoot:  config.watch.shotDataDir,
       supabase:   config.supabase.serviceKey ? 'enabled' : 'disabled',
       optix:      config.optix?.orgToken ? 'enabled' : 'disabled',
@@ -66,9 +66,10 @@ async function main() {
     },
   });
 
-  // Connect log tail: reads ConnectDebug.txt, extracts envelopes, feeds the
-  // reassembler. This is the canonical ingress — every shot GSPconnect sends
-  // to GS Pro is mirrored here in mph/yards with carry pre-computed.
+  // Shot log tail: reads either VIEW's Player.log (current canonical source,
+  // ====> envelopes) or GSPconnect's ConnectDebug.txt (legacy, '- {' log4net
+  // prefix), extracts envelopes, feeds the reassembler. Both sources speak
+  // GS Pro Open Connect — mph, yards, carry already computed.
   const logTail = createConnectLogTail({
     config,
     logger,

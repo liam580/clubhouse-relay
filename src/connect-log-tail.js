@@ -1,24 +1,36 @@
 'use strict';
 
-// Tail GSPconnect's ConnectDebug.txt (default
-// C:\GSProV1\Core\GSPC\ConnectDebug.txt) and emit each parsed Open Connect
-// envelope to the reassembler. The log is the canonical egress for the
-// post-translation GS Pro envelope — mph, yards, carry already computed.
+// Tail a log file that mirrors the GSPro Open Connect envelope stream and
+// emit each parsed envelope to the reassembler.
 //
-// Filter strategy: any line whose suffix starts with `- {"DeviceID` is a
-// shot/heartbeat envelope. Vendor-agnostic — works across the Uneekor,
-// FullSwing, FlightScope, etc. logger names. JSON.parse extracts the
-// envelope; we hand it to the reassembler unchanged.
+// Two known sources produce that envelope on this stack, both selectable
+// via config.connect.logPath:
 //
-// Rotation: log4net renames the active file when it crosses 10 MB. The
-// `tail` package's useWatchFile + follow handles rotation by polling the
-// stat — we lose the in-flight line but pick up immediately on the new
-// file.
+//   1. Uneekor VIEW's `Player.log` (the current canonical source).
+//      `%USERPROFILE%\AppData\LocalLow\Uneekor\VIEW\Player.log`
+//      VIEW logs each outbound envelope with an "====>" prefix and
+//      packs BallData + ClubData into ONE line.
+//
+//   2. GSPconnect's `ConnectDebug.txt` (the original 2026-06-15 source,
+//      no longer in the data path on bays where VIEW talks to GS Pro
+//      directly — see docs/session-findings-2026-06-18.md).
+//      Connect logs envelopes with a `- {"DeviceID` log4net prefix and
+//      fans the shot out across 4 DEBUG+INFO lines (ball half + club
+//      half), which the reassembler stitches back together.
+//
+// MARKER is the substring that identifies either format — `{"DeviceID"`
+// is the JSON envelope opener common to both. extractEnvelope scans
+// forward from MARKER for the first `{` and JSON.parses from there, so
+// it's tolerant to any prefix shape (log4net, "====>", future formats).
+//
+// Rotation: VIEW's Player.log rolls only when VIEW restarts (rare in
+// practice — multiple days between rotations). GSPconnect rotates on
+// 10 MB. `tail`'s useWatchFile + follow handles either rate.
 
 const fs = require('fs');
 const { Tail } = require('tail');
 
-const MARKER = '- {"DeviceID';
+const MARKER = '{"DeviceID"';
 const HEARTBEAT_MS = 5 * 60 * 1000;
 
 function extractEnvelope(line) {
@@ -50,7 +62,7 @@ function createConnectLogTail({ config, logger, onEnvelope }) {
       logger.warn({ logPath }, 'Connect log does not exist yet — tail will wait for the file');
     }
 
-    logger.info({ logPath, fromBeginning }, 'starting Connect log tail');
+    logger.info({ logPath, fromBeginning }, 'starting shot log tail');
 
     try {
       tail = new Tail(logPath, {
@@ -95,12 +107,12 @@ function createConnectLogTail({ config, logger, onEnvelope }) {
           envelopesEmitted,
           msSinceLastEnvelope: lastEnvelopeAt ? Date.now() - lastEnvelopeAt : null,
         },
-        'Connect log tail heartbeat'
+        'shot log tail heartbeat'
       );
     }, HEARTBEAT_MS);
     if (heartbeat.unref) heartbeat.unref();
 
-    logger.info('Connect log tail attached');
+    logger.info('shot log tail attached');
   }
 
   function stop() {

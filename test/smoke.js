@@ -206,10 +206,31 @@ function extractEnvelopeScenario() {
   const env2 = extractEnvelope(fullSwingLine);
   assert.ok(env2 && env2.DeviceID === 'FULLSWING-X', 'works for FullSwing logger name');
 
+  // Marker is also format-agnostic — works for VIEW's Player.log "====>" prefix,
+  // which is now the canonical source on bays where VIEW talks to GS Pro
+  // directly (see docs/session-findings-2026-06-18.md). VIEW packs BallData
+  // + ClubData into one envelope rather than the Connect 4-line fan-out.
+  const viewLine = '====>  {"DeviceID":"UNEEKOR EYEXR","Units":"Yards","ShotNumber":163920,"APIversion":"2","BallData":{"Speed":124.866,"BackSpin":3875,"SideSpin":-2827,"HLA":1.386,"VLA":16.351,"CarryDistance":172.817},"ClubData":{"Speed":94.464,"FaceToTarget":0.434,"Path":-2.1},"ShotDataOptions":{"ContainsBallData":true,"ContainsClubData":true,"IsHeartBeat":false}}';
+  const envView = extractEnvelope(viewLine);
+  assert.ok(envView, 'VIEW ====> prefix parses');
+  assert.strictEqual(envView.ShotNumber, 163920);
+  assert.strictEqual(envView.BallData.Speed, 124.866);
+  assert.strictEqual(envView.BallData.CarryDistance, 172.817);
+  assert.strictEqual(envView.ClubData.Speed, 94.464);
+
+  // VIEW LM-status envelope (no BallData/ClubData; IsHeartBeat:false but
+  // both Contains-flags false). Should still parse — the reassembler is
+  // what filters status pings via its !containsBall && !containsClub guard.
+  const viewStatusLine = '====>  {"DeviceID":"UNEEKOREYEXR","Units":"Yards","ShotNumber":163921,"APIversion":"2","ShotDataOptions":{"ContainsBallData":false,"ContainsClubData":false,"LaunchMonitorIsReady":false,"LaunchMonitorBallDetected":false,"IsHeartBeat":false}}';
+  const envViewStatus = extractEnvelope(viewStatusLine);
+  assert.ok(envViewStatus, 'VIEW status envelope parses');
+  assert.strictEqual(envViewStatus.ShotNumber, 163921);
+
   console.log('  ✓ valid log line → parsed envelope');
   console.log('  ✓ non-matching line → null');
   console.log('  ✓ malformed JSON after marker → null');
   console.log('  ✓ vendor-agnostic across logger names');
+  console.log('  ✓ format-agnostic: VIEW ====> prefix + Connect - {} prefix');
 }
 
 function reassemblerHappyPathScenario() {
@@ -499,6 +520,51 @@ async function fixtureLogEndToEndScenario() {
   console.log(`  ✓ parsed ${envelopesParsed} envelopes from fixture (6 envelope lines + 2 non-matches)`);
   console.log('  ✓ shot 42508 emitted with both halves');
   console.log('  ✓ shot 42509 emitted as partial after sweep');
+}
+
+async function viewPlayerLogFixtureScenario() {
+  console.log('\n— scenario: end-to-end — VIEW Player.log fixture → parser → reassembler → shots —');
+
+  const logPath = path.join(__dirname, 'fixtures', 'view-player-sample.log');
+  const lines = fs.readFileSync(logPath, 'utf8').split('\n').filter(Boolean);
+
+  const emitted = [];
+  const r = createReassembler({ timeoutMs: 30, sweepIntervalMs: 100, onShot: (m) => emitted.push(m) });
+
+  let envelopesParsed = 0;
+  for (const line of lines) {
+    const env = extractEnvelope(line);
+    if (env == null) continue;
+    envelopesParsed++;
+    r.feed(env);
+  }
+
+  await sleep(80);
+  r.sweep();
+  r.stop();
+
+  // The VIEW fixture has:
+  // - 3 noise lines (Unity log statements, GSPro <==== response, etc.) — non-matches
+  // - 2 LM-status envelopes (ShotNumber 163919 + 163921; ContainsBallData/ClubData both false; not heartbeats but no shot data) — dropped by reassembler guard
+  // - 2 complete shot envelopes (ShotNumber 163920 + 163946) with BallData AND ClubData in ONE line each → 2 emits
+  // = 4 envelopes parsed, 2 shots emitted
+  assert.strictEqual(envelopesParsed, 4, `parsed ${envelopesParsed} envelopes`);
+  assert.strictEqual(emitted.length, 2, `emitted ${emitted.length} shots`);
+
+  const shot163920 = emitted.find((m) => m.ShotNumber === 163920);
+  assert.ok(shot163920, 'shot 163920 emitted');
+  assert.strictEqual(shot163920.BallData.Speed, 124.86599011734009);
+  assert.strictEqual(shot163920.BallData.CarryDistance, 172.81694987344477);
+  assert.strictEqual(shot163920.ClubData.Speed, 94.46373946479798);
+
+  const shot163946 = emitted.find((m) => m.ShotNumber === 163946);
+  assert.ok(shot163946, 'shot 163946 emitted');
+  assert.strictEqual(shot163946.BallData.Speed, 122.27337576988221);
+  assert.strictEqual(shot163946.BallData.CarryDistance, 173.09911398570299);
+
+  console.log(`  ✓ parsed ${envelopesParsed} envelopes from VIEW fixture (4 ====> envelopes, 3 noise lines skipped)`);
+  console.log('  ✓ both shots emitted with BallData + ClubData in single envelope');
+  console.log('  ✓ LM-status envelopes (ContainsBall/Club:false, IsHeartBeat:false) correctly dropped — no phantom rows');
 }
 
 // ─── fake servers (reused) ──────────────────────────────────────────────
@@ -1002,6 +1068,7 @@ async function shotTaggingScenario() {
     await sideWatcherReferenceShotScenario();
     sideWatcherStaleScenario();
     await fixtureLogEndToEndScenario();
+    await viewPlayerLogFixtureScenario();
 
     // M2 — Supabase + JSONL with Connect-shaped rows
     await supabasePostScenario();
