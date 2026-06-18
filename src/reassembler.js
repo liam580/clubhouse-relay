@@ -55,7 +55,7 @@ function createReassembler({
     emitted++;
     if (!ball || !club) partials++;
     if (logger) {
-      logger.debug(
+      logger.info(
         { ShotNumber: n, hasBall: !!ball, hasClub: !!club, partial: !ball || !club },
         'reassembler emit'
       );

@@ -86,6 +86,18 @@ function createPersistence({ config, logger, dataDir, supabase, getTag }) {
       logger.error({ err: err.message }, 'failed to append to shots.jsonl');
     }
 
+    logger.info(
+      {
+        shotNumber: row.shot_number,
+        sessionId:  row.session_id,
+        playerId:   row.player_id,
+        club:       row.club,
+        ballSpeed:  row.ball_speed,
+        carry:      row.carry_distance,
+      },
+      'shot saved'
+    );
+
     supa.insertShot(row).catch((err) => {
       logger.error({ err: err.message }, 'supabase insertShot failed');
     });

@@ -19,6 +19,7 @@ const fs = require('fs');
 const { Tail } = require('tail');
 
 const MARKER = '- {"DeviceID';
+const HEARTBEAT_MS = 5 * 60 * 1000;
 
 function extractEnvelope(line) {
   if (line == null) return null;
@@ -42,6 +43,7 @@ function createConnectLogTail({ config, logger, onEnvelope }) {
   let linesSeen = 0;
   let envelopesEmitted = 0;
   let lastEnvelopeAt = null;
+  let heartbeat = null;
 
   async function start() {
     if (!fs.existsSync(logPath)) {
@@ -69,8 +71,12 @@ function createConnectLogTail({ config, logger, onEnvelope }) {
       linesSeen++;
       const env = extractEnvelope(line);
       if (env == null) return;
+      const wasFirst = envelopesEmitted === 0;
       envelopesEmitted++;
       lastEnvelopeAt = Date.now();
+      if (wasFirst) {
+        logger.info({ ShotNumber: env.ShotNumber, linesSeen }, 'first envelope detected after start');
+      }
       try {
         onEnvelope(env);
       } catch (err) {
@@ -82,11 +88,24 @@ function createConnectLogTail({ config, logger, onEnvelope }) {
       logger.error({ err: err.message || String(err) }, 'tail error');
     });
 
+    heartbeat = setInterval(() => {
+      logger.info(
+        {
+          linesSeen,
+          envelopesEmitted,
+          msSinceLastEnvelope: lastEnvelopeAt ? Date.now() - lastEnvelopeAt : null,
+        },
+        'Connect log tail heartbeat'
+      );
+    }, HEARTBEAT_MS);
+    if (heartbeat.unref) heartbeat.unref();
+
     logger.info('Connect log tail attached');
   }
 
   function stop() {
     stopped = true;
+    if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
     if (tail) {
       try { tail.unwatch(); } catch { /* swallow */ }
       tail = null;
