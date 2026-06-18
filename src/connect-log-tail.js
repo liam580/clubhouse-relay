@@ -32,6 +32,8 @@ const { Tail } = require('tail');
 
 const MARKER = '{"DeviceID"';
 const HEARTBEAT_MS = 5 * 60 * 1000;
+const REATTACH_INITIAL_MS = 5 * 1000;
+const REATTACH_MAX_MS = 60 * 1000;
 
 function extractEnvelope(line) {
   if (line == null) return null;
@@ -56,14 +58,19 @@ function createConnectLogTail({ config, logger, onEnvelope }) {
   let envelopesEmitted = 0;
   let lastEnvelopeAt = null;
   let heartbeat = null;
+  let reattachTimer = null;
+  let reattachBackoffMs = REATTACH_INITIAL_MS;
+  let reattachCount = 0;
+  let lastReattachAt = null;
 
-  async function start() {
+  // Build a fresh Tail and wire its listeners. Returns true on success,
+  // false on failure (caller schedules retry).
+  function attach() {
+    if (stopped) return false;
     if (!fs.existsSync(logPath)) {
-      logger.warn({ logPath }, 'Connect log does not exist yet — tail will wait for the file');
+      logger.warn({ logPath }, 'log file does not exist yet — will retry');
+      return false;
     }
-
-    logger.info({ logPath, fromBeginning }, 'starting shot log tail');
-
     try {
       tail = new Tail(logPath, {
         follow: true,
@@ -75,7 +82,7 @@ function createConnectLogTail({ config, logger, onEnvelope }) {
       });
     } catch (err) {
       logger.error({ err: err.message, logPath }, 'failed to create Tail');
-      throw err;
+      return false;
     }
 
     tail.on('line', (line) => {
@@ -97,8 +104,62 @@ function createConnectLogTail({ config, logger, onEnvelope }) {
     });
 
     tail.on('error', (err) => {
-      logger.error({ err: err.message || String(err) }, 'tail error');
+      logger.error({ err: err.message || String(err), reattachBackoffMs }, 'tail error — scheduling re-attach');
+      scheduleReattach();
     });
+
+    return true;
+  }
+
+  // Re-attach after a delay with exponential backoff. Idempotent — if a
+  // re-attach is already scheduled, this is a no-op. Backoff caps at
+  // REATTACH_MAX_MS and resets to REATTACH_INITIAL_MS after a successful
+  // attach that survives long enough to see a line.
+  function scheduleReattach() {
+    if (stopped || reattachTimer) return;
+    if (tail) {
+      try { tail.unwatch(); } catch { /* swallow */ }
+      tail = null;
+    }
+    reattachTimer = setTimeout(() => {
+      reattachTimer = null;
+      if (stopped) return;
+      reattachCount++;
+      lastReattachAt = Date.now();
+      logger.info({ logPath, reattachCount, backoffMs: reattachBackoffMs }, 're-attaching shot log tail');
+      const ok = attach();
+      if (ok) {
+        logger.info({ logPath }, 'shot log tail re-attached');
+        // Don't reset the backoff yet — wait for a line to confirm the
+        // attach is healthy. Reset happens in the line handler below
+        // via the first successful read after a re-attach.
+        const lineCountAtAttach = linesSeen;
+        setTimeout(() => {
+          if (!stopped && linesSeen > lineCountAtAttach) {
+            reattachBackoffMs = REATTACH_INITIAL_MS;
+          }
+        }, 30 * 1000);
+      } else {
+        reattachBackoffMs = Math.min(reattachBackoffMs * 2, REATTACH_MAX_MS);
+        scheduleReattach();
+      }
+    }, reattachBackoffMs);
+    if (reattachTimer.unref) reattachTimer.unref();
+  }
+
+  async function start() {
+    if (!fs.existsSync(logPath)) {
+      logger.warn({ logPath }, 'log file does not exist yet — tail will wait for the file');
+    }
+
+    logger.info({ logPath, fromBeginning }, 'starting shot log tail');
+
+    const ok = attach();
+    if (!ok) {
+      // File missing or constructor threw — let the re-attach loop handle it.
+      logger.warn({ logPath }, 'initial attach failed — entering re-attach loop');
+      scheduleReattach();
+    }
 
     heartbeat = setInterval(() => {
       logger.info(
@@ -106,6 +167,9 @@ function createConnectLogTail({ config, logger, onEnvelope }) {
           linesSeen,
           envelopesEmitted,
           msSinceLastEnvelope: lastEnvelopeAt ? Date.now() - lastEnvelopeAt : null,
+          attached: tail != null,
+          reattachCount,
+          lastReattachAt,
         },
         'shot log tail heartbeat'
       );
@@ -118,6 +182,7 @@ function createConnectLogTail({ config, logger, onEnvelope }) {
   function stop() {
     stopped = true;
     if (heartbeat) { clearInterval(heartbeat); heartbeat = null; }
+    if (reattachTimer) { clearTimeout(reattachTimer); reattachTimer = null; }
     if (tail) {
       try { tail.unwatch(); } catch { /* swallow */ }
       tail = null;
@@ -130,6 +195,9 @@ function createConnectLogTail({ config, logger, onEnvelope }) {
       envelopesEmitted,
       lastEnvelopeAt,
       msSinceLastEnvelope: lastEnvelopeAt ? Date.now() - lastEnvelopeAt : null,
+      attached: tail != null,
+      reattachCount,
+      lastReattachAt,
     };
   }
 
